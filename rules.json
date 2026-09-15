@@ -1,0 +1,18 @@
+{
+  "block_threshold": 1,
+  "level_low": 0.40,
+  "level_medium": 0.55,
+  "level_high": 0.65,
+  "level_critical": 0.80,
+  "high_to_critical_delay": 10,
+  "auto_unblock_minutes": 10,
+  "enable_block": true,
+  "detection_threshold": {
+    "PortScan": 0.80,
+    "BruteForce": 0.80,
+    "DDoS": 0.80,
+    "XSS": 0.85,
+    "SQLi": 0.85
+  },
+  "extra_whitelist": []
+}
