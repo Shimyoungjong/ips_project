@@ -9,9 +9,10 @@ import threading
 app = Flask(__name__)
 app.secret_key = 'supersecretkey'
 
-DB_PATH    = '/tmp/honeypot_users.db'
-LOG_FILE   = '/tmp/honeypot_log.txt'
-MAC_API    = 'http://192.168.64.1:8000/server_log'  # Mac FastAPI (bridge100 고정)
+DB_PATH      = '/tmp/honeypot_users.db'
+LOG_FILE     = '/tmp/honeypot_log.txt'
+MAC_API      = 'http://192.168.64.1:8000/server_log'    # Mac FastAPI (bridge100 고정) - 로깅/대시보드용
+MAC_API_HTTP = 'http://192.168.64.1:8000/detect_http'    # Mac FastAPI - SQLi/XSS ML 탐지용
 
 def send_to_mac(ip, method, path, payload=''):
     try:
@@ -23,6 +24,20 @@ def send_to_mac(ip, method, path, payload=''):
             "payload": payload,
             "timestamp": datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
         }, timeout=1)
+    except:
+        pass
+
+def send_to_detect_http(ip, payload):
+    """실제로 /search, /board 등에 들어온 값 하나하나를 SQLi/XSS ML 분류기로 보낸다.
+    이전에는 honeypot이 /server_log(단순 로깅)만 호출해서 진짜 공격이 들어와도
+    ML 탐지가 한 번도 안 돌았음 — 이걸 고쳐서 실제 공격 트래픽이 탐지/차단 흐름까지 이어지게 함."""
+    if not payload:
+        return
+    try:
+        req.post(MAC_API_HTTP, json={
+            "payload": payload,
+            "attacker_ip": ip,
+        }, timeout=2)
     except:
         pass
 
@@ -44,11 +59,20 @@ def log_all():
     payloads = list(request.args.values()) + list(request.form.values())
     payload_str = ' | '.join(payloads) if payloads else ''
     log_request(payload_str)
+    ip = request.remote_addr
     threading.Thread(
         target=send_to_mac,
-        args=(request.remote_addr, request.method, request.path, payload_str),
+        args=(ip, request.method, request.path, payload_str),
         daemon=True
     ).start()
+    # 입력값 하나하나를 SQLi/XSS ML 분류기로 보냄 (합쳐진 문자열이 아니라 개별 값 기준 —
+    # detect_http가 학습된 피처(쿼터 개수, --, ;, SQL/XSS 키워드 등)는 단일 입력값 단위로 의미가 있음)
+    for value in payloads:
+        threading.Thread(
+            target=send_to_detect_http,
+            args=(ip, value),
+            daemon=True
+        ).start()
 
 # ==================== 공통 HTML (원본 그대로) ====================
 def base_html(content, title='HiSecure Corp'):
