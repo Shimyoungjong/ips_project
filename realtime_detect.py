@@ -6,11 +6,12 @@ import time
 import subprocess
 import sqlite3
 import requests
-import re
 import ipaddress
+import socket
+import threading
+import atexit
+import signal
 from datetime import datetime, timedelta
-from urllib.parse import urlparse, unquote
-from scapy.all import AsyncSniffer, IP, TCP, Raw
 from scapy_flow import ScapyFlowCollector
 
 MODEL_DIR = os.path.expanduser("~/ips_project/models")
@@ -18,20 +19,47 @@ CSV_PATH  = os.path.expanduser("~/ips_project/captures/test.csv")
 DB_PATH   = os.path.expanduser("~/ips_project/ips_logs.db")
 
 # ==================== 설정 ====================
-AUTO_UNBLOCK_MINUTES = 10
 FASTAPI_URL  = "http://localhost:8000/alert"
 WATCHLIST_URL = "http://localhost:8000/watchlist"
-ENABLE_BLOCK = True
 ENABLE_DASHBOARD = True
-CONFIDENCE_THRESHOLD = 0.75
-BLOCK_THRESHOLD = 1
 BLOCK_WINDOW_SECONDS = 300
+RULES_PATH = os.path.expanduser("~/ips_project/rules.json")
 
-# 단계별 대응 임계값
-LEVEL_LOW      = 0.50  # DB 정밀 기록
-LEVEL_MEDIUM   = 0.60  # 대역폭 제한
-LEVEL_HIGH     = 0.75  # 허니팟 리다이렉트
-LEVEL_CRITICAL = 0.90  # pfctl 즉시 차단 + pcap 수집
+import json
+
+def load_rules():
+    global AUTO_UNBLOCK_MINUTES, ENABLE_BLOCK, BLOCK_THRESHOLD
+    global LEVEL_LOW, LEVEL_MEDIUM, LEVEL_HIGH, LEVEL_CRITICAL
+    global HIGH_TO_CRITICAL_DELAY, DETECTION_THRESHOLD
+    try:
+        with open(RULES_PATH) as f:
+            r = json.load(f)
+        AUTO_UNBLOCK_MINUTES  = r.get('auto_unblock_minutes', 10)
+        ENABLE_BLOCK          = r.get('enable_block', True)
+        BLOCK_THRESHOLD       = r.get('block_threshold', 3)
+        LEVEL_LOW             = r.get('level_low', 0.40)
+        LEVEL_MEDIUM          = r.get('level_medium', 0.55)
+        LEVEL_HIGH            = r.get('level_high', 0.65)
+        LEVEL_CRITICAL        = r.get('level_critical', 0.80)
+        HIGH_TO_CRITICAL_DELAY= r.get('high_to_critical_delay', 60)
+        DETECTION_THRESHOLD   = r.get('detection_threshold', {})
+        for ip in r.get('extra_whitelist', []):
+            if ip not in WHITELIST:
+                WHITELIST.append(ip)
+        print(f"✅ rules.json 로드 완료 (BLOCK_THRESHOLD={BLOCK_THRESHOLD}, HIGH={LEVEL_HIGH}, CRITICAL={LEVEL_CRITICAL})")
+    except Exception as e:
+        print(f"⚠️ rules.json 로드 실패: {e}")
+
+# 초기 기본값
+AUTO_UNBLOCK_MINUTES = 10
+ENABLE_BLOCK = True
+BLOCK_THRESHOLD = 3
+LEVEL_LOW      = 0.40
+LEVEL_MEDIUM   = 0.55
+LEVEL_HIGH     = 0.65
+LEVEL_CRITICAL = 0.80
+HIGH_TO_CRITICAL_DELAY = 60
+DETECTION_THRESHOLD = {}
 
 EVIDENCE_DIR = os.path.expanduser("~/ips_project/evidence")
 os.makedirs(EVIDENCE_DIR, exist_ok=True)
@@ -76,11 +104,36 @@ _ubuntu_ip  = get_ubuntu_wifi_ip()
 print(f"🌐 Mac en0 IP: {_my_ip or '감지 실패'}")
 print(f"🖥️  Ubuntu WiFi IP: {_ubuntu_ip or '감지 실패 (bridge100만 사용)'}")
 
+def get_default_gateway():
+    """현재 라우팅 테이블의 default gateway 자동 감지 (네트워크 바뀌어도 항상 예외처리)"""
+    try:
+        r = subprocess.run(['route', '-n', 'get', 'default'],
+                           capture_output=True, text=True, timeout=3)
+        for line in r.stdout.splitlines():
+            if 'gateway:' in line:
+                return line.split(':', 1)[1].strip()
+    except Exception:
+        pass
+    return None
+
+def get_self_ips():
+    """이 호스트(Mac) 자신의 모든 IP — self-block 방지용 동적 화이트리스트"""
+    ips = {'127.0.0.1', '0.0.0.0'}
+    try:
+        hostname = socket.gethostname()
+        ips |= set(socket.gethostbyname_ex(hostname)[2])
+    except Exception:
+        pass
+    return ips
+
 # 화이트리스트 (절대 차단 안 할 IP)
-WHITELIST = ['127.0.0.1', '0.0.0.0', '192.168.64.1', '172.20.10.1', '172.20.10.2']
-if _my_ip:
-    WHITELIST.append(_my_ip)
-    print(f"✅ 화이트리스트에 Mac IP 추가: {_my_ip}")
+# self-IP / 게이트웨이는 네트워크가 바뀌어도(가정 와이파이 ↔ 핫스팟) 항상 동적으로 감지해서 추가
+# → 과거 IPS가 맥북 자기 자신을 PortScan으로 오탐·차단해 인터넷이 끊긴 장애 재발 방지
+WHITELIST = list({'127.0.0.1', '0.0.0.0', '192.168.64.1'}
+                  | get_self_ips()
+                  | ({_my_ip} if _my_ip else set())
+                  | ({get_default_gateway()} if get_default_gateway() else set()))
+print(f"⬜ 화이트리스트(self/gateway 포함): {WHITELIST}")
 
 # 오탐 확인된 IP 대역 화이트리스트
 WHITELIST_RANGES = [
@@ -286,10 +339,17 @@ def apply_response(ip, conf, attack_type, is_watchlisted):
     if is_whitelisted(ip):
         return
 
-    if conf >= LEVEL_CRITICAL and is_watchlisted:
-        respond_critical(ip, attack_type)
+    now = time.time()
+    if conf >= LEVEL_CRITICAL:
+        # 감시목록 or HIGH 이력 있으면 즉시 CRITICAL, 아니면 HIGH로 격상 후 CRITICAL 준비
+        if is_watchlisted or (ip in high_response_time and (now - high_response_time[ip]) >= HIGH_TO_CRITICAL_DELAY):
+            respond_critical(ip, attack_type)
+        else:
+            respond_high(ip)
+            high_response_time[ip] = now - HIGH_TO_CRITICAL_DELAY  # 다음번엔 바로 CRITICAL 발동
     elif conf >= LEVEL_HIGH:
         respond_high(ip)
+        high_response_time[ip] = now
     elif conf >= LEVEL_MEDIUM:
         respond_medium(ip)
     elif conf >= LEVEL_LOW:
@@ -298,25 +358,11 @@ def apply_response(ip, conf, attack_type, is_watchlisted):
 # ==================== IP 차단 ====================
 blocked_ips = {}     # {ip: unblock_time}
 attack_counts = {}   # {ip: [timestamp, timestamp, ...]} 이중 확인용
+high_response_time = {}  # {ip: timestamp} HIGH 발동 시각 기록
+HIGH_TO_CRITICAL_DELAY = 60  # HIGH → CRITICAL 최소 대기 시간 (초)
+dst_port_tracker = {}   # {ip: set(dst_ports)} 목적지 포트 추적
+DST_PORT_WINDOW = 30    # 초
 
-# ==================== PortScan 휴리스틱 ====================
-PORT_SCAN_THRESHOLD = 30   # 5초 안에 30개 이상 다른 포트 → PortScan
-PORT_SCAN_WINDOW    = 5    # 초
-port_scan_tracker   = {}   # {ip: {'ports': set, 'first_seen': float}}
-
-def check_port_scan(src_ip, dst_port):
-    now = time.time()
-    if src_ip not in port_scan_tracker:
-        port_scan_tracker[src_ip] = {'ports': set(), 'first_seen': now}
-    t = port_scan_tracker[src_ip]
-    if now - t['first_seen'] > PORT_SCAN_WINDOW:
-        port_scan_tracker[src_ip] = {'ports': set(), 'first_seen': now}
-        t = port_scan_tracker[src_ip]
-    t['ports'].add(dst_port)
-    if len(t['ports']) >= PORT_SCAN_THRESHOLD:
-        port_scan_tracker[src_ip] = {'ports': set(), 'first_seen': now}
-        return True
-    return False
 
 def check_attack_count(ip):
     now = time.time()
@@ -326,39 +372,6 @@ def check_attack_count(ip):
     attack_counts[ip].append(now)
     return len(attack_counts[ip])
 
-def block_ip(ip, attack_type):
-    if not ENABLE_BLOCK:
-        return False
-    if is_whitelisted(ip):
-        return False
-    if ip in blocked_ips:
-        return False
-
-    try:
-        subprocess.run(
-            ['/sbin/pfctl', '-t', 'blocklist', '-T', 'add', ip],
-            capture_output=True
-        )
-
-        unblock_time = datetime.now() + timedelta(minutes=AUTO_UNBLOCK_MINUTES)
-        blocked_ips[ip] = unblock_time
-
-        # DB 저장
-        conn = sqlite3.connect(DB_PATH)
-        c = conn.cursor()
-        c.execute('''INSERT INTO blocked_ips (ip, attack_type, blocked_at, auto_unblock_at)
-                     VALUES (?, ?, ?, ?)''',
-                  (ip, attack_type,
-                   datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-                   unblock_time.strftime('%Y-%m-%d %H:%M:%S')))
-        conn.commit()
-        conn.close()
-
-        print(f"  🚫 {ip} 차단 완료! ({AUTO_UNBLOCK_MINUTES}분 후 자동 해제)")
-        return True
-    except Exception as e:
-        print(f"  ⚠️ 차단 실패: {e}")
-        return False
 
 # ==================== IP 자동 해제 ====================
 def check_unblock():
@@ -422,121 +435,20 @@ def send_to_dashboard(attack_type, attacker_ip, confidence, is_attack, blocked):
 model               = joblib.load(os.path.join(MODEL_DIR, 'rf_model.pkl'))
 feature_names       = joblib.load(os.path.join(MODEL_DIR, 'feature_names.pkl'))
 classes             = joblib.load(os.path.join(MODEL_DIR, 'classes.pkl'))
-http_model          = joblib.load(os.path.join(MODEL_DIR, 'rf_model_http.pkl'))
-http_feature_names  = joblib.load(os.path.join(MODEL_DIR, 'http_feature_names.pkl'))
 print("✅ 모델 로드 완료!")
 print(f"✅ 탐지 클래스: {list(classes)}")
-print(f"✅ HTTP 탐지 클래스: SQLi / XSS")
 
 init_db()
 init_pf()
 
-# ==================== HTTP 스니퍼 ====================
-def extract_http_features(payload):
-    p = payload.lower()
-    return [[
-        len(payload),
-        payload.count("'"),
-        payload.count('"'),
-        payload.count('--'),
-        payload.count(';'),
-        payload.count('='),
-        payload.count(' ') + payload.count('+') + payload.count('%20'),
-        payload.count('%'),
-        int('select' in p),
-        int('union' in p),
-        int('insert' in p),
-        int('drop' in p),
-        int('delete' in p),
-        int('update' in p),
-        int(' or ' in p),
-        int(' and ' in p),
-        int('where' in p),
-        int('from' in p),
-        int('sleep' in p),
-        int('benchmark' in p),
-        int('<script' in p),
-        int('<img' in p),
-        int('<svg' in p),
-        int('<iframe' in p),
-        int('onerror' in p),
-        int('onload' in p),
-        int('onclick' in p),
-        int('alert' in p),
-        int('document' in p),
-        int('javascript' in p),
-        payload.count('<') + payload.count('>'),
-        sum(payload.count(c) for c in "!@#$%^&*()[]{}|\\<>"),
-    ]]
-
-def scapy_packet_callback(pkt):
-    if IP not in pkt or TCP not in pkt:
-        return
-
-    src_ip   = pkt[IP].src
-    dst_port = pkt[TCP].dport
-
-    if is_whitelisted(src_ip):
-        return
-
-    # PortScan 휴리스틱: 모든 포트 대상으로 체크 (HTTP payload 불필요)
-    if check_port_scan(src_ip, dst_port):
-        conf = 0.95
-        print(f"  🔍 [PortScan] 탐지! | IP: {src_ip} | {PORT_SCAN_THRESHOLD}개+ 포트 스캔")
-        count = check_attack_count(src_ip)
-        is_watchlisted = src_ip in watchlist_cache
-        if count >= BLOCK_THRESHOLD:
-            apply_response(src_ip, conf, 'PortScan', is_watchlisted)
-            attack_counts[src_ip] = []
-        save_log('PortScan', src_ip, conf, True, False)
-        send_to_dashboard('PortScan', src_ip, conf, True, False)
-        return
-
-    # HTTP SQLi/XSS 탐지: 포트 5000만
-    if dst_port != 5000:
-        return
-    if Raw not in pkt:
-        return
-
-    try:
-        payload = pkt[Raw].load.decode('utf-8', errors='ignore')
-    except Exception:
-        return
-
-    get_match = re.search(r'GET ([^\s]+) HTTP', payload)
-    if not get_match:
-        return
-
-    url   = get_match.group(1)
-    query = unquote(urlparse(url).query)
-    if not query:
-        return
-
-    try:
-        X    = extract_http_features(query)
-        pred = http_model.predict(X)[0]
-        conf = float(http_model.predict_proba(X)[0].max())
-        if pred != 'BENIGN' and conf >= 0.5:
-            print(f"  🌐 [HTTP/{pred}] 탐지! (신뢰도: {conf:.1%}) | IP: {src_ip} | {query[:60]}")
-            count = check_attack_count(src_ip)
-            is_watchlisted = src_ip in watchlist_cache
-            if count >= BLOCK_THRESHOLD:
-                apply_response(src_ip, conf, pred, is_watchlisted)
-                attack_counts[src_ip] = []
-            save_log(pred, src_ip, conf, True, False)
-            send_to_dashboard(pred, src_ip, conf, True, False)
-    except Exception:
-        pass
-
-_http_sniffer = AsyncSniffer(
-    iface='en0',
-    filter='tcp and dst port 5000',
-    prn=scapy_packet_callback,
-    store=False,
-)
 
 # ==================== Scapy → RF 모델 콜백 ====================
 PROTECTED_IPS = {'192.168.64.10', '192.168.64.11'} | ({_ubuntu_ip} if _ubuntu_ip else set())
+
+# 보호 대상(타겟) 명시 — 웹서버(5000)/허니팟(9999)으로 향하거나 그 응답인 플로우만 탐지 대상으로 삼음.
+# 이걸 두면 Mac 자체 트래픽이든 Ubuntu 관리 트래픽이든 "보호 자산"과 무관한 플로우는
+# 캡처 소스(en0 / ubuntu_agent)가 뭐든 상관없이 애초에 모델 판정 자체를 안 함.
+PROTECT_TARGET_PORTS = {UBUNTU_REAL_PORT, UBUNTU_HONEYPOT_PORT}
 
 def on_flow_complete(features):
     """ScapyFlowCollector 콜백: 완료된 플로우 → RF 모델 탐지"""
@@ -545,6 +457,12 @@ def on_flow_complete(features):
         dst_ip = features.get('dst_ip', 'unknown')
 
         if is_whitelisted(src_ip):
+            return
+
+        # 보호 대상(웹서버/허니팟) 포트와 무관한 플로우는 애초에 판정하지 않음
+        _sp = int(features.get('src_port', 0) or 0)
+        _dp = int(features.get('dst_port', 0) or 0)
+        if PROTECT_TARGET_PORTS and _sp not in PROTECT_TARGET_PORTS and _dp not in PROTECT_TARGET_PORTS:
             return
 
         # 피처 dict → DataFrame + 파생 피처 (train_mydata.py와 동일)
@@ -571,7 +489,6 @@ def on_flow_complete(features):
 
         pred = model.predict(X)[0]
         conf = float(model.predict_proba(X)[0].max())
-        is_attack = pred != 'BENIGN'
 
         # 공격자 IP 결정 (보호 대상이 src이면 dst가 공격자)
         if src_ip in PROTECTED_IPS and dst_ip not in ('unknown', ''):
@@ -579,15 +496,28 @@ def on_flow_complete(features):
         else:
             attacker_ip = src_ip
 
+        # DDoS → PortScan 후처리: 목적지 포트 종류 3개 이상이면 PortScan으로 변경
+        dst_port = int(features.get('dst_port', 0))
+        now_t = time.time()
+        if attacker_ip not in dst_port_tracker:
+            dst_port_tracker[attacker_ip] = {'ports': set(), 'first_seen': now_t}
+        if now_t - dst_port_tracker[attacker_ip]['first_seen'] > DST_PORT_WINDOW:
+            dst_port_tracker[attacker_ip] = {'ports': set(), 'first_seen': now_t}
+        dst_port_tracker[attacker_ip]['ports'].add(dst_port)
+        if pred == 'DDoS' and len(dst_port_tracker[attacker_ip]['ports']) >= 3:
+            pred = 'PortScan'
+
+        is_attack = pred != 'BENIGN'
+
         if is_whitelisted(attacker_ip) or attacker_ip in PROTECTED_IPS:
             return
 
-        threshold = (0.80 if pred == 'PortScan'
-                     else 0.80 if pred == 'BruteForce'
-                     else 0.80 if pred == 'DDoS'
-                     else 0.85 if pred == 'XSS'
-                     else 0.85 if pred == 'SQLi'
-                     else CONFIDENCE_THRESHOLD)
+        # 이미 차단된 IP → 조용히 DROP (로그/대시보드 미기록)
+        if attacker_ip in blocked_ips:
+            print(f"  🚫 [DROP] {attacker_ip} 이미 차단된 IP — 플로우 무시")
+            return
+
+        threshold = DETECTION_THRESHOLD.get(pred, LEVEL_HIGH)
         if is_attack and conf < threshold:
             return
 
@@ -599,7 +529,7 @@ def on_flow_complete(features):
             if count >= BLOCK_THRESHOLD:
                 apply_response(attacker_ip, conf, pred, is_wl)
                 attack_counts[attacker_ip] = []
-            blocked = conf >= LEVEL_CRITICAL
+            blocked = attacker_ip in blocked_ips
             save_log(pred, attacker_ip, conf, True, blocked)
             send_to_dashboard(pred, attacker_ip, conf, True, blocked)
         else:
@@ -613,9 +543,49 @@ watchlist_cache      = set()
 last_unblock_check   = datetime.now()
 last_watchlist_fetch = datetime.now()
 
-# ==================== HTTP 스니퍼 시작 ====================
-_http_sniffer.start()
-print("✅ Scapy HTTP 스니퍼 시작! (en0 포트 5000 → SQLi/XSS + PortScan 탐지)")
+# ==================== Ubuntu 에이전트 수신 서버 ====================
+AGENT_PORT = 9001
+
+def _handle_agent_client(conn, addr):
+    print(f"✅ Ubuntu 에이전트 연결됨: {addr[0]}:{addr[1]}")
+    buf = ''
+    try:
+        while True:
+            data = conn.recv(4096)
+            if not data:
+                break
+            buf += data.decode('utf-8', errors='ignore')
+            while '\n' in buf:
+                line, buf = buf.split('\n', 1)
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    features = json.loads(line)
+                    on_flow_complete(features)
+                except Exception:
+                    pass
+    except Exception:
+        pass
+    finally:
+        conn.close()
+        print(f"⚠️ Ubuntu 에이전트 연결 끊김: {addr[0]}")
+
+def _agent_server_thread():
+    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    srv.bind(('0.0.0.0', AGENT_PORT))
+    srv.listen(5)
+    print(f"✅ Ubuntu 에이전트 수신 서버 시작! (포트 {AGENT_PORT})")
+    while True:
+        try:
+            conn, addr = srv.accept()
+            t = threading.Thread(target=_handle_agent_client, args=(conn, addr), daemon=True)
+            t.start()
+        except Exception:
+            pass
+
+threading.Thread(target=_agent_server_thread, daemon=True).start()
 
 # ==================== Scapy 플로우 수집기 시작 ====================
 flow_collector = ScapyFlowCollector(iface='en0', callback=on_flow_complete)
@@ -627,7 +597,22 @@ print(f"🔍 실시간 IPS 시작! (Scapy 플로우 탐지)")
 print(f"⏱️  자동 차단 해제: {AUTO_UNBLOCK_MINUTES}분")
 print(f"{'='*50}\n")
 
-# ==================== 메인 루프 (자동 해제 + 감시목록) ====================
+# ==================== 메인 루프 (자동 해제 + 감시목록 + 룰 갱신) ====================
+_rules_mtime = 0
+load_rules()  # 시작 시 룰 로드
+
+def cleanup_pf():
+    """종료 시 pf 차단 테이블 정리 — '유령 룰' 잔존으로 인터넷이 영구 차단되는 것 방지"""
+    try:
+        for table in ['blocklist', 'throttlelist', 'highlist']:
+            subprocess.run(['/sbin/pfctl', '-t', table, '-T', 'flush'], capture_output=True)
+        print("🧹 pf 차단 테이블 정리 완료 (blocklist/throttlelist/highlist flush)")
+    except Exception as e:
+        print(f"⚠️ pf 정리 실패: {e}")
+
+atexit.register(cleanup_pf)
+signal.signal(signal.SIGTERM, lambda *_: (_ for _ in ()).throw(SystemExit()))
+
 try:
     while True:
         if (datetime.now() - last_unblock_check).seconds >= 60:
@@ -636,8 +621,16 @@ try:
         if (datetime.now() - last_watchlist_fetch).seconds >= 30:
             watchlist_cache = get_watchlist()
             last_watchlist_fetch = datetime.now()
+        # rules.json 변경 감지 → 자동 반영
+        try:
+            mtime = os.path.getmtime(RULES_PATH)
+            if mtime != _rules_mtime:
+                _rules_mtime = mtime
+                load_rules()
+        except Exception:
+            pass
         time.sleep(1)
-except KeyboardInterrupt:
+except (KeyboardInterrupt, SystemExit):
     flow_collector.stop()
     print(f"\n{'='*50}")
     print(f"🛑 IPS 종료!")
