@@ -1,7 +1,8 @@
 import React, { useState, useEffect, useRef } from 'react';
 import axios from 'axios';
-import { ShieldAlert, Activity, BarChart3, Clock, Server, Eye, Trash2 } from 'lucide-react';
-import { BarChart, Bar, XAxis, YAxis, Tooltip, Cell } from 'recharts';
+import { ShieldAlert, Activity, BarChart3, Clock, Eye, Trash2 } from 'lucide-react';
+import bb, { bar } from 'billboard.js';
+import 'billboard.js/dist/billboard.css';
 
 const ATTACK_COLORS = {
   BruteForce: '#f97316',
@@ -15,8 +16,8 @@ const ATTACK_COLORS = {
 const styles = {
   container: { padding: '30px', backgroundColor: '#0f172a', minHeight: '100vh', color: '#f1f5f9', fontFamily: "'Pretendard', sans-serif" },
   header: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '30px', borderBottom: '1px solid #334155', paddingBottom: '20px' },
-  grid: { display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: '20px', marginBottom: '20px' },
-  card: { backgroundColor: '#1e293b', padding: '20px', borderRadius: '16px', border: '1px solid #334155', boxShadow: '0 4px 6px -1px rgba(0, 0, 0, 0.1)' },
+  grid: { display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: '20px', marginBottom: '20px', alignItems: 'stretch' },
+  card: { backgroundColor: '#1e293b', padding: '28px 32px', borderRadius: '16px', border: '1px solid #334155', boxShadow: '0 4px 6px -1px rgba(0, 0, 0, 0.1)' },
   tableSection: { backgroundColor: '#1e293b', borderRadius: '16px', border: '1px solid #334155', overflow: 'hidden', marginBottom: '20px' },
   table: { width: '100%', borderCollapse: 'collapse' },
   th: { backgroundColor: '#334155', padding: '15px', textAlign: 'left', fontSize: '14px', color: '#94a3b8' },
@@ -45,8 +46,10 @@ function App() {
   const [ipsRunning, setIpsRunning] = useState(false);
   const [attackTypeCounts, setAttackTypeCounts] = useState({});
   const [watchlist, setWatchlist] = useState([]);
+  const [blockedIps, setBlockedIps] = useState([]);
   const chartContainerRef = useRef(null);
-  const [chartWidth, setChartWidth] = useState(800);
+  const chartInstanceRef = useRef(null);
+  const chartCategoriesRef = useRef([]);
 
   useEffect(() => {
     const timer = setInterval(() => setCurrentTime(new Date().toLocaleTimeString()), 1000);
@@ -58,6 +61,18 @@ function App() {
       const res = await axios.get('http://localhost:8000/watchlist');
       setWatchlist(res.data);
     } catch {}
+  };
+
+  const fetchBlockedIps = async () => {
+    try {
+      const res = await axios.get('http://localhost:8000/blocked_ips');
+      setBlockedIps(res.data);
+    } catch {}
+  };
+
+  const handleBlockedDecision = async (ip, action) => {
+    await axios.post('http://localhost:8000/blocked_ips/decide', { ip, action });
+    fetchBlockedIps();
   };
 
   const fetchData = async () => {
@@ -88,6 +103,7 @@ function App() {
     setServerLogs([]);
     setWatchlist([]);
     setAttackTypeCounts({});
+    setBlockedIps([]);
   };
 
   const handleStop = async () => {
@@ -101,19 +117,74 @@ function App() {
     alert('✅ 긴급 해제 완료! 모든 차단이 풀렸습니다.');
   };
 
-  const testResponse = async (level) => {
-    await axios.post('http://localhost:8000/test_response', {
-      ip: '192.168.219.118', level
-    });
-  };
-
   const handleRemoveWatchlist = async (ip) => {
     await axios.post('http://localhost:8000/watchlist/remove', { ip });
     fetchWatchlist();
   };
 
   useEffect(() => {
-    if (chartContainerRef.current) setChartWidth(chartContainerRef.current.offsetWidth);
+    const types = Object.keys(attackTypeCounts);
+    const counts = types.map((t) => attackTypeCounts[t]);
+    chartCategoriesRef.current = types;
+
+    if (!chartContainerRef.current) return;
+    // 데이터가 아직 없으면(공격 0건) 차트 생성/갱신 자체를 건너뜀.
+    // billboard.js가 빈 데이터로 생성된 인스턴스에 .load()로 카테고리를 갱신할 때
+    // 내부 상태(isCategorized)가 비어 있어 크래시하는 버그가 있어서 회피.
+    if (types.length === 0) return;
+
+    // .load()로 카테고리(x축)까지 바꾸면 billboard.js 내부 상태가 깨지는 경우가 있어서,
+    // 매번 destroy 후 다시 generate하는 방식으로 안전하게 처리.
+    if (chartInstanceRef.current) {
+      try {
+        chartInstanceRef.current.destroy();
+      } catch (e) {
+        // destroy 중 에러가 나도 무시하고 새로 생성
+      }
+      chartInstanceRef.current = null;
+    }
+
+    try {
+      chartInstanceRef.current = bb.generate({
+        bindto: chartContainerRef.current,
+        size: { height: 150 },
+        data: {
+          columns: [['건수', ...counts]],
+          type: bar(),
+          color: (color, d) => {
+            if (d && typeof d.index === 'number') {
+              return ATTACK_COLORS[chartCategoriesRef.current[d.index]] || '#64748b';
+            }
+            return color;
+          },
+        },
+        bar: { radius: { ratio: 0.25 } },
+        axis: {
+          x: { type: 'category', categories: types, tick: { text: { style: { fill: '#94a3b8' } } } },
+          y: { tick: { format: (v) => Math.round(v), text: { style: { fill: '#94a3b8' } } } },
+        },
+        legend: { show: false },
+        grid: { y: { show: false } },
+        tooltip: {
+          format: {
+            title: () => '',
+            name: (name, ratio, id, index) => chartCategoriesRef.current[index] || name,
+            value: (value) => `${value}건`,
+          },
+        },
+      });
+    } catch (e) {
+      console.error('차트 생성 실패:', e);
+    }
+  }, [attackTypeCounts]);
+
+  useEffect(() => {
+    return () => {
+      if (chartInstanceRef.current) {
+        chartInstanceRef.current.destroy();
+        chartInstanceRef.current = null;
+      }
+    };
   }, []);
 
   const enableNotifications = () => {
@@ -126,7 +197,8 @@ function App() {
   useEffect(() => {
     fetchData();
     fetchWatchlist();
-    const interval = setInterval(() => { fetchData(); fetchWatchlist(); }, 5000);
+    fetchBlockedIps();
+    const interval = setInterval(() => { fetchData(); fetchWatchlist(); fetchBlockedIps(); }, 5000);
 
     let ws;
     let reconnectTimer;
@@ -146,6 +218,10 @@ function App() {
           setServerLogs(prev => [newLog, ...prev].slice(0, 100));
           return;
         }
+        if (newLog.type === 'blocked_ip_update') {
+          fetchBlockedIps();
+          return;
+        }
         if (newLog.is_attack === true || newLog.is_attack === 1) {
           setAttackTypeCounts(prev => ({
             ...prev,
@@ -154,7 +230,13 @@ function App() {
           if (newLog.attack_type === 'Honeypot') {
             fetchWatchlist();
           }
-          if (newLog.confidence >= 0.9 && Notification.permission === 'granted') {
+          if (newLog.blocked && Notification.permission === 'granted') {
+            new Notification('🚫 IP 차단됨 — 관리자 검토 필요', {
+              body: `${newLog.attack_type} | IP: ${newLog.attacker_ip} | 블랙리스트 등록됨, 검토 후 조치하세요.`,
+              icon: '/favicon.ico'
+            });
+            fetchBlockedIps();
+          } else if (newLog.confidence >= 0.9 && Notification.permission === 'granted') {
             new Notification('🔴 Critical 공격 탐지!', {
               body: `${newLog.attack_type} | IP: ${newLog.attacker_ip}`,
               icon: '/favicon.ico'
@@ -211,17 +293,6 @@ function App() {
           <button onClick={enableNotifications} style={{ padding: '8px 16px', borderRadius: '8px', border: 'none', backgroundColor: '#334155', color: '#94a3b8', cursor: 'pointer', fontSize: '13px' }}>
             🔔 알림 허용
           </button>
-          <div style={{ display: 'flex', gap: '6px' }}>
-            {['low','medium','high','critical'].map(level => (
-              <button key={level} onClick={() => testResponse(level)} style={{
-                padding: '6px 12px', borderRadius: '6px', border: 'none', cursor: 'pointer', fontSize: '12px', fontWeight: 'bold',
-                backgroundColor: {low:'#14532d',medium:'#78350f',high:'#7f1d1d',critical:'#4c0519'}[level],
-                color: {low:'#86efac',medium:'#fcd34d',high:'#fca5a5',critical:'#f9a8d4'}[level],
-              }}>
-                TEST {level.toUpperCase()}
-              </button>
-            ))}
-          </div>
           <div style={{ display: 'flex', alignItems: 'center', gap: '8px', color: '#94a3b8' }}>
             <Clock size={18} /> {currentTime}
           </div>
@@ -253,22 +324,20 @@ function App() {
         <div style={{ display: 'flex', alignItems: 'center', gap: '10px', color: '#94a3b8', marginBottom: '15px' }}>
           <BarChart3 size={20} /> 공격 유형별 탐지 건수
         </div>
-        <div ref={chartContainerRef} style={{ width: '100%' }}>
-          <BarChart width={chartWidth} height={150}
-            data={Object.entries(attackTypeCounts).map(([type, count]) => ({ type, count }))}
-            margin={{ top: 5, right: 10, left: -10, bottom: 5 }}>
-            <XAxis dataKey="type" tick={{ fill: '#94a3b8', fontSize: 12 }} />
-            <YAxis tick={{ fill: '#94a3b8', fontSize: 10 }} allowDecimals={false} />
-            <Tooltip
-              contentStyle={{ backgroundColor: '#1e293b', border: '1px solid #334155', color: '#f1f5f9' }}
-              formatter={(value) => [`${value}건`, '탐지 건수']}
-            />
-            <Bar dataKey="count" radius={[4, 4, 0, 0]}>
-              {Object.entries(attackTypeCounts).map(([type]) => (
-                <Cell key={type} fill={ATTACK_COLORS[type] || '#64748b'} />
-              ))}
-            </Bar>
-          </BarChart>
+        <div style={{ position: 'relative', width: '100%' }}>
+          {Object.keys(attackTypeCounts).length === 0 && (
+            <div style={{
+              position: 'absolute', inset: 0, display: 'flex', flexDirection: 'column',
+              alignItems: 'center', justifyContent: 'center', color: '#475569', gap: '8px', zIndex: 1,
+            }}>
+              <BarChart3 size={32} color="#334155" />
+              <span style={{ fontSize: '14px' }}>탐지된 공격 없음</span>
+            </div>
+          )}
+          <div
+            ref={chartContainerRef}
+            style={{ width: '100%', height: '150px', visibility: Object.keys(attackTypeCounts).length === 0 ? 'hidden' : 'visible' }}
+          />
         </div>
       </div>
 
@@ -278,6 +347,9 @@ function App() {
         <button style={styles.tab(tab === 'server_logs')} onClick={() => setTab('server_logs')}>🖥️ 서버 접속 로그</button>
         <button style={styles.tab(tab === 'watchlist')} onClick={() => setTab('watchlist')}>
           👁 감시목록 {watchlist.length > 0 && <span style={{ marginLeft: '6px', backgroundColor: '#06b6d4', color: '#fff', borderRadius: '10px', padding: '1px 7px', fontSize: '11px' }}>{watchlist.length}</span>}
+        </button>
+        <button style={styles.tab(tab === 'blocked')} onClick={() => setTab('blocked')}>
+          🚫 차단 관리 {blockedIps.length > 0 && <span style={{ marginLeft: '6px', backgroundColor: '#ef4444', color: '#fff', borderRadius: '10px', padding: '1px 7px', fontSize: '11px' }}>{blockedIps.length}</span>}
         </button>
       </div>
 
@@ -295,7 +367,17 @@ function App() {
               </tr>
             </thead>
             <tbody>
-              {logs.map((log, index) => (
+              {logs.length === 0 ? (
+                <tr>
+                  <td colSpan={5} style={{ ...styles.td, textAlign: 'center', padding: '48px', color: '#475569' }}>
+                    <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '10px' }}>
+                      <ShieldAlert size={36} color="#334155" />
+                      <span style={{ fontSize: '15px' }}>탐지된 위협 없음</span>
+                      <span style={{ fontSize: '12px', color: '#334155' }}>IPS가 실행되면 탐지 로그가 여기에 표시됩니다</span>
+                    </div>
+                  </td>
+                </tr>
+              ) : logs.map((log, index) => (
                 <tr key={index}>
                   <td style={{ ...styles.td, color: log.is_attack ? '#ef4444' : '#22c55e', fontWeight: 'bold' }}>{log.attack_type}</td>
                   <td style={styles.td}>{log.attacker_ip}</td>
@@ -386,6 +468,62 @@ function App() {
                     >
                       <Trash2 size={14} />
                     </button>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </section>
+      )}
+
+      {tab === 'blocked' && (
+        <section style={styles.tableSection}>
+          <div style={{ padding: '20px', borderBottom: '1px solid #334155', fontWeight: 'bold', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+            <span>🚫 차단된 IP — 관리자 검토 대기</span>
+            <span style={{ fontSize: '13px', color: '#94a3b8' }}>기본 10분 후 자동 해제 (영구 차단 선택 시 제외)</span>
+          </div>
+          <table style={styles.table}>
+            <thead>
+              <tr>
+                <th style={styles.th}>IP 주소</th>
+                <th style={styles.th}>공격 유형</th>
+                <th style={styles.th}>차단 시각</th>
+                <th style={styles.th}>상태</th>
+                <th style={styles.th}>자동 해제 시각</th>
+                <th style={styles.th}>관리자 조치</th>
+              </tr>
+            </thead>
+            <tbody>
+              {blockedIps.length === 0 ? (
+                <tr><td colSpan={6} style={{ ...styles.td, textAlign: 'center', color: '#475569' }}>현재 차단된 IP 없음</td></tr>
+              ) : blockedIps.map((item) => (
+                <tr key={item.id}>
+                  <td style={{ ...styles.td, fontFamily: 'monospace', color: '#ef4444' }}>{item.ip}</td>
+                  <td style={styles.td}>{item.attack_type}</td>
+                  <td style={styles.td}>{item.blocked_at}</td>
+                  <td style={styles.td}>
+                    {item.permanent
+                      ? <span style={styles.threatBadge('critical')}>영구 차단</span>
+                      : item.reviewed
+                        ? <span style={styles.threatBadge('medium')}>검토 완료(10분)</span>
+                        : <span style={styles.threatBadge('high')}>검토 대기</span>}
+                  </td>
+                  <td style={styles.td}>{item.permanent ? '—' : item.auto_unblock_at}</td>
+                  <td style={styles.td}>
+                    <div style={{ display: 'flex', gap: '6px' }}>
+                      <button
+                        onClick={() => handleBlockedDecision(item.ip, 'keep_10min')}
+                        style={{ padding: '4px 10px', borderRadius: '6px', border: '1px solid #475569', background: 'none', color: '#fcd34d', cursor: 'pointer', fontSize: '12px' }}
+                      >10분 유지</button>
+                      <button
+                        onClick={() => handleBlockedDecision(item.ip, 'permanent')}
+                        style={{ padding: '4px 10px', borderRadius: '6px', border: '1px solid #475569', background: 'none', color: '#f9a8d4', cursor: 'pointer', fontSize: '12px' }}
+                      >영구 차단</button>
+                      <button
+                        onClick={() => handleBlockedDecision(item.ip, 'unblock')}
+                        style={{ padding: '4px 10px', borderRadius: '6px', border: '1px solid #475569', background: 'none', color: '#86efac', cursor: 'pointer', fontSize: '12px' }}
+                      >즉시 해제</button>
+                    </div>
                   </td>
                 </tr>
               ))}
