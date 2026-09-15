@@ -1,5 +1,6 @@
 import os
 import signal
+import atexit
 import sqlite3
 import subprocess
 import pandas as pd
@@ -10,6 +11,7 @@ from pydantic import BaseModel
 from datetime import datetime, timedelta
 from typing import List, Any, Dict
 import time
+import asyncio
 
 app = FastAPI()
 
@@ -86,8 +88,16 @@ def init_db():
         attack_type     TEXT NOT NULL,
         blocked_at      TEXT NOT NULL,
         auto_unblock_at TEXT NOT NULL,
-        unblocked       INTEGER DEFAULT 0
+        unblocked       INTEGER DEFAULT 0,
+        permanent       INTEGER DEFAULT 0,
+        reviewed        INTEGER DEFAULT 0
     )''')
+    # 기존 DB에 컬럼이 없으면 추가 (마이그레이션)
+    for col, ddl in [('permanent', 'INTEGER DEFAULT 0'), ('reviewed', 'INTEGER DEFAULT 0')]:
+        try:
+            cursor.execute(f'ALTER TABLE blocked_ips ADD COLUMN {col} {ddl}')
+        except sqlite3.OperationalError:
+            pass  # 이미 존재함
     cursor.execute('''CREATE TABLE IF NOT EXISTS watchlist (
         id           INTEGER PRIMARY KEY AUTOINCREMENT,
         ip           TEXT NOT NULL UNIQUE,
@@ -176,21 +186,33 @@ class AlertData(BaseModel):
 
 @app.post("/alert")
 async def receive_alert(data: AlertData):
+    # ── 이미 차단된 IP → 조용히 무시 (로그/대시보드 미기록) ──
+    if data.attacker_ip in blocked_ips:
+        print(f"  🚫 [ALERT] {data.attacker_ip} 이미 차단된 IP — 무시")
+        return {"status": "blocked_skip"}
+
+    # ── HTTP 공격 횟수 카운트 → 임계치(3회/30초) 초과 시 PF 차단 ──
+    count = check_http_count(data.attacker_ip)
+    actually_blocked = False
+    if count >= HTTP_BLOCK_THRESHOLD:
+        actually_blocked = block_ip(data.attacker_ip, data.attack_type)
+
+    now_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     cursor.execute(
         "INSERT INTO attack_logs (attack_type, attacker_ip, timestamp, confidence, is_attack, blocked) VALUES (?,?,?,?,?,?)",
-        (data.attack_type, data.attacker_ip, data.timestamp, data.confidence, int(data.is_attack), int(data.blocked))
+        (data.attack_type, data.attacker_ip, now_str, data.confidence, int(data.is_attack), int(actually_blocked))
     )
     conn.commit()
     conn.close()
     await manager.broadcast({
         "attack_type": data.attack_type,
         "attacker_ip": data.attacker_ip,
-        "timestamp": data.timestamp,
+        "timestamp": now_str,
         "confidence": data.confidence,
         "is_attack": data.is_attack,
-        "blocked": data.blocked
+        "blocked": actually_blocked
     })
     return {"status": "ok"}
 
@@ -322,6 +344,211 @@ def ubuntu_clear_ip(ip):
     ubuntu_ssh(f"sudo iptables -D INPUT -s {ip} -p tcp --dport 5000 -m hashlimit --hashlimit-above 5/sec --hashlimit-burst 10 --hashlimit-mode srcip --hashlimit-name throttle_{ip.replace('.','_')} -j DROP 2>/dev/null; true")
     ubuntu_ssh(f"sudo iptables -t nat -D PREROUTING -s {ip} -p tcp --dport 5000 -j REDIRECT --to-port 9999 2>/dev/null; true")
 
+# ==================== 위협 레벨 기반 단계적 대응 ====================
+# realtime_detect.py의 흐름 기반 탐지(apply_response)와 동일한 임계값/단계를 사용해서
+# 공격 종류(흐름 기반 PortScan/DDoS든, 콘텐츠 기반 SQLi/XSS든) 상관없이 같은 기준으로 대응한다.
+LEVEL_LOW              = 0.40
+LEVEL_MEDIUM           = 0.55
+LEVEL_HIGH             = 0.65
+LEVEL_CRITICAL         = 0.80
+HIGH_TO_CRITICAL_DELAY = 60   # 초 — HIGH 대응 후 이 시간 내에 다시 CRITICAL급이면 바로 완전차단
+
+UBUNTU_REAL_PORT     = 5000
+UBUNTU_HONEYPOT_PORT = 9999
+
+high_response_time = {}   # {ip: timestamp} - HIGH 단계를 적용한 시각 (CRITICAL 승격 판단용)
+
+def is_watchlisted(ip: str) -> bool:
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute("SELECT 1 FROM watchlist WHERE ip=? AND active=1", (ip,))
+        row = cursor.fetchone()
+        conn.close()
+        return row is not None
+    except Exception:
+        return False
+
+def respond_low(ip):
+    print(f"  📋 [LOW] {ip} → 로그 기록 및 모니터링")
+
+def respond_medium(ip):
+    print(f"  🔶 [MEDIUM] {ip} → 연결 속도 제한 적용")
+    try:
+        subprocess.run(['sudo', 'pfctl', '-t', 'throttlelist', '-T', 'add', ip], capture_output=True)
+        ubuntu_ssh(
+            f"sudo iptables -I INPUT -s {ip} -p tcp --dport {UBUNTU_REAL_PORT} "
+            f"-m hashlimit --hashlimit-above 5/sec --hashlimit-burst 10 "
+            f"--hashlimit-mode srcip --hashlimit-name throttle_{ip.replace('.','_')} -j DROP"
+        )
+    except Exception as e:
+        print(f"  ⚠️ [MEDIUM] 속도 제한 실패: {e}")
+
+def respond_high(ip):
+    print(f"  🔴 [HIGH] {ip} → 정상서버(포트 {UBUNTU_REAL_PORT}) 트래픽을 허니팟으로 리다이렉트")
+    try:
+        subprocess.run(['sudo', 'pfctl', '-t', 'highlist', '-T', 'add', ip], capture_output=True)
+        ubuntu_ssh(
+            f"sudo iptables -I PREROUTING -t nat -s {ip} -p tcp --dport {UBUNTU_REAL_PORT} "
+            f"-j REDIRECT --to-port {UBUNTU_HONEYPOT_PORT}"
+        )
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute(
+            "INSERT OR REPLACE INTO watchlist (ip, reason, threat_level, added_at, active) VALUES (?,?,?,?,1)",
+            (ip, "HIGH 레벨 공격 — 허니팟 리다이렉트", "high", datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
+        )
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        print(f"  ⚠️ [HIGH] 리다이렉트 실패: {e}")
+
+def respond_critical(ip, attack_type):
+    print(f"  🚫 [CRITICAL] {ip} → 완전 차단")
+    try:
+        subprocess.run(['sudo', 'pfctl', '-t', 'blocklist', '-T', 'add', ip], capture_output=True)
+        ubuntu_ssh(f"sudo iptables -I INPUT -s {ip} -j DROP")
+        ubuntu_ssh(f"sudo iptables -I FORWARD -s {ip} -j DROP")
+        unblock_time = datetime.now() + timedelta(minutes=AUTO_UNBLOCK_MINUTES)
+        blocked_ips[ip] = unblock_time
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute(
+            "INSERT OR IGNORE INTO blocked_ips (ip, attack_type, blocked_at, auto_unblock_at) VALUES (?,?,?,?)",
+            (ip, attack_type, datetime.now().strftime('%Y-%m-%d %H:%M:%S'), unblock_time.strftime('%Y-%m-%d %H:%M:%S'))
+        )
+        conn.commit()
+        conn.close()
+        return True
+    except Exception as e:
+        print(f"  ⚠️ [CRITICAL] 차단 실패: {e}")
+        return False
+
+def apply_threat_response(ip: str, conf: float, attack_type: str):
+    """신뢰도(conf) 하나만 가지고 LOW/MEDIUM/HIGH/CRITICAL 대응을 실행.
+    흐름 기반(PortScan/DDoS)이든 콘텐츠 기반(SQLi/XSS)이든 이 함수 하나로 통일."""
+    if ip in WHITELIST:
+        return "whitelist", False
+
+    now = time.time()
+    watchlisted = is_watchlisted(ip)
+    blocked = False
+
+    if conf >= LEVEL_CRITICAL:
+        if watchlisted or (ip in high_response_time and (now - high_response_time[ip]) >= HIGH_TO_CRITICAL_DELAY):
+            blocked = respond_critical(ip, attack_type)
+            level = "critical"
+        else:
+            respond_high(ip)
+            high_response_time[ip] = now - HIGH_TO_CRITICAL_DELAY  # 다음번엔 바로 CRITICAL 발동
+            level = "high"
+    elif conf >= LEVEL_HIGH:
+        respond_high(ip)
+        high_response_time[ip] = now
+        level = "high"
+    elif conf >= LEVEL_MEDIUM:
+        respond_medium(ip)
+        level = "medium"
+    elif conf >= LEVEL_LOW:
+        respond_low(ip)
+        level = "low"
+    else:
+        level = "none"
+    return level, blocked
+
+def unblock_ip(ip: str):
+    """차단 해제: pf/우분투 룰 제거 + DB 갱신 + 메모리 상태 정리"""
+    try:
+        subprocess.run(['sudo', 'pfctl', '-t', 'blocklist', '-T', 'delete', ip], capture_output=True)
+        subprocess.run(['sudo', 'pfctl', '-t', 'highlist', '-T', 'delete', ip], capture_output=True)
+        subprocess.run(['sudo', 'pfctl', '-t', 'throttlelist', '-T', 'delete', ip], capture_output=True)
+        ubuntu_clear_ip(ip)
+        blocked_ips.pop(ip, None)
+        high_response_time.pop(ip, None)
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute(
+            "UPDATE blocked_ips SET unblocked=1, reviewed=1 WHERE ip=? AND unblocked=0",
+            (ip,)
+        )
+        cursor.execute("UPDATE watchlist SET active=0 WHERE ip=?", (ip,))
+        conn.commit()
+        conn.close()
+        print(f"  ✅ [관리자] {ip} 차단 해제 완료")
+        return True
+    except Exception as e:
+        print(f"  ⚠️ [관리자] {ip} 차단 해제 실패: {e}")
+        return False
+
+@app.get("/blocked_ips")
+async def get_blocked_ips():
+    """관리자 대기 화면용 — 현재 차단 중인 IP 목록 (해제 여부 무관, 최신순)"""
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT * FROM blocked_ips WHERE unblocked=0 ORDER BY id DESC"
+    )
+    rows = [dict(r) for r in cursor.fetchall()]
+    conn.close()
+    return rows
+
+@app.post("/blocked_ips/decide")
+async def decide_blocked_ip(data: dict):
+    """관리자가 차단 건을 검토하고 내리는 결정: keep_10min / permanent / unblock"""
+    ip     = data.get("ip")
+    action = data.get("action")
+    if not ip or action not in ("keep_10min", "permanent", "unblock"):
+        from fastapi import HTTPException
+        raise HTTPException(status_code=400, detail="ip와 action(keep_10min/permanent/unblock)이 필요합니다.")
+
+    if action == "unblock":
+        ok = unblock_ip(ip)
+        await manager.broadcast({"type": "blocked_ip_update", "ip": ip, "action": "unblock", "ok": ok})
+        return {"status": "unblocked" if ok else "failed", "ip": ip}
+
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    if action == "permanent":
+        cursor.execute(
+            "UPDATE blocked_ips SET permanent=1, reviewed=1, auto_unblock_at=? WHERE ip=? AND unblocked=0",
+            ("9999-12-31 23:59:59", ip)
+        )
+    else:  # keep_10min — 타이머 재시작
+        new_unblock = (datetime.now() + timedelta(minutes=AUTO_UNBLOCK_MINUTES)).strftime('%Y-%m-%d %H:%M:%S')
+        cursor.execute(
+            "UPDATE blocked_ips SET permanent=0, reviewed=1, auto_unblock_at=? WHERE ip=? AND unblocked=0",
+            (new_unblock, ip)
+        )
+        blocked_ips[ip] = datetime.now() + timedelta(minutes=AUTO_UNBLOCK_MINUTES)
+    conn.commit()
+    conn.close()
+    await manager.broadcast({"type": "blocked_ip_update", "ip": ip, "action": action, "ok": True})
+    return {"status": action, "ip": ip}
+
+async def auto_unblock_loop():
+    """10분(또는 설정 시간)이 지난 비영구 차단 IP를 주기적으로 자동 해제"""
+    while True:
+        try:
+            conn = sqlite3.connect(DB_PATH)
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT ip FROM blocked_ips WHERE unblocked=0 AND permanent=0 AND auto_unblock_at <= ?",
+                (datetime.now().strftime('%Y-%m-%d %H:%M:%S'),)
+            )
+            expired = [r[0] for r in cursor.fetchall()]
+            conn.close()
+            for ip in expired:
+                unblock_ip(ip)
+                await manager.broadcast({"type": "blocked_ip_update", "ip": ip, "action": "auto_unblock", "ok": True})
+        except Exception as e:
+            print(f"  ⚠️ 자동 해제 루프 오류: {e}")
+        await asyncio.sleep(30)
+
+@app.on_event("startup")
+async def start_background_tasks():
+    asyncio.create_task(auto_unblock_loop())
+
 @app.post("/test_response")
 async def test_response(data: dict):
     """테스트용 강제 대응 트리거 — 실제 차단 시스템까지 실행"""
@@ -388,6 +615,14 @@ async def clear_watchlist():
 
 @app.post("/detect_http")
 async def detect_http(data: HttpPayload):
+    now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+
+    # ── 이미 차단된 IP → 즉시 거부 (로그 없이 DROP) ──
+    if data.attacker_ip in blocked_ips:
+        print(f"  🚫 [HTTP] {data.attacker_ip} 이미 차단된 IP — 조용히 거부 (로그 미기록)")
+        from fastapi import HTTPException
+        raise HTTPException(status_code=403, detail="차단된 IP입니다. 접근이 거부되었습니다.")
+
     features = extract_http_features(data.payload)
     X = pd.DataFrame([[features.get(f, 0) for f in http_feature_names]], columns=http_feature_names)
     pred = http_model.predict(X)[0]
@@ -395,19 +630,14 @@ async def detect_http(data: HttpPayload):
 
     is_attack = pred != 'BENIGN'
     blocked   = False
-    now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    level     = "none"
 
-    # ── HTTP 공격 탐지 시 PF 자동 차단 로직 ──
-    if is_attack and data.attacker_ip not in WHITELIST:
-        count = check_http_count(data.attacker_ip)
+    # ── 흐름 기반 탐지와 동일한 4단계(LOW/MEDIUM/HIGH/CRITICAL) 대응으로 통일 ──
+    if is_attack:
+        level, blocked = apply_threat_response(data.attacker_ip, conf, pred)
         print(f"  🚨 [HTTP] {pred} 탐지! IP: {data.attacker_ip} "
-              f"(신뢰도: {conf:.1%}) [{count}/{HTTP_BLOCK_THRESHOLD}회]")
-        if count >= HTTP_BLOCK_THRESHOLD:
-            blocked = block_ip(data.attacker_ip, pred)
-            http_attack_counts[data.attacker_ip] = []   # 카운터 초기화
-    elif is_attack:
-        print(f"  🚨 [HTTP] {pred} 탐지! IP: {data.attacker_ip} "
-              f"(신뢰도: {conf:.1%}) [화이트리스트 — 차단 제외]")
+              f"(신뢰도: {conf:.1%}) → 레벨: {level.upper()}"
+              + (" [화이트리스트 제외]" if level == "whitelist" else ""))
 
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
@@ -424,9 +654,10 @@ async def detect_http(data: HttpPayload):
         "timestamp": now,
         "confidence": conf,
         "is_attack": is_attack,
-        "blocked": blocked
+        "blocked": blocked,
+        "threat_level": level
     })
-    return {"attack_type": pred, "confidence": conf, "is_attack": is_attack, "blocked": blocked}
+    return {"attack_type": pred, "confidence": conf, "is_attack": is_attack, "blocked": blocked, "threat_level": level}
 
 @app.post("/predict")
 async def predict_flow(flow: Dict[str, Any]):
@@ -535,6 +766,48 @@ cic_proc     = None
 detect_proc  = None
 session_start = None  # 현재 세션 시작 시간
 
+def _kill_ips_subprocesses():
+    """cic_proc/detect_proc(둘 다 sudo + setsid로 띄운 독립 세션 프로세스) 강제 종료.
+    main.py가 정상 종료(/stop)든, 터미널 닫기/Ctrl+C/kill 등 비정상 종료든
+    항상 호출되도록 atexit + SIGTERM/SIGHUP 핸들러에 등록되어 있음.
+    이게 없으면 main.py 프로세스가 죽어도 setsid로 분리된 자식들은
+    터미널 SIGHUP을 받지 않아 백그라운드에 고아 프로세스로 영원히 남는다.
+
+    중요: cic_proc/detect_proc는 'sudo ...'로 띄워서 root 권한으로 실행됨.
+    main.py 자체가 root로 안 돌고 있으면 일반 kill/pkill은 권한 때문에
+    조용히 실패한다(except로 삼켜짐) — 이게 지금까지 "/stop 눌러도 백그라운드에
+    남는다"의 진짜 원인일 가능성이 높음. 그래서 일반 kill과 sudo kill을 둘 다 시도함.
+    sudo가 비밀번호를 요구하면 이 호출도 멈출 수 있으니, main.py를 실행하는 계정에
+    'sudo kill', 'sudo pkill' 이 NOPASSWD로 허용돼 있는지 확인 필요 (visudo)."""
+    global cic_proc, detect_proc
+    for proc in [cic_proc, detect_proc]:
+        if proc:
+            try:
+                pgid = os.getpgid(proc.pid)
+            except Exception:
+                continue
+            try:
+                os.killpg(pgid, signal.SIGTERM)
+            except Exception:
+                pass
+            subprocess.run(['sudo', '-n', 'kill', '-TERM', f'-{pgid}'], capture_output=True)
+    subprocess.run(['pkill', '-f', 'realtime_detect.py'], capture_output=True)
+    subprocess.run(['pkill', '-f', 'cicflowmeter'], capture_output=True)
+    subprocess.run(['sudo', '-n', 'pkill', '-f', 'realtime_detect.py'], capture_output=True)
+    subprocess.run(['sudo', '-n', 'pkill', '-f', 'cicflowmeter'], capture_output=True)
+    cic_proc = None
+    detect_proc = None
+
+atexit.register(_kill_ips_subprocesses)
+
+def _handle_terminating_signal(signum, frame):
+    _kill_ips_subprocesses()
+    raise SystemExit(0)
+
+# SIGTERM: kill 명령/정상 종료 신호, SIGHUP: 터미널 창을 그냥 닫았을 때 전달되는 신호
+signal.signal(signal.SIGTERM, _handle_terminating_signal)
+signal.signal(signal.SIGHUP, _handle_terminating_signal)
+
 def clear_ubuntu_logs():
     """Ubuntu 허니팟/서버 로그 초기화"""
     try:
@@ -584,18 +857,7 @@ async def start_ips():
 
 @app.post("/stop")
 async def stop_ips():
-    global cic_proc, detect_proc
-    for proc in [cic_proc, detect_proc]:
-        if proc:
-            try:
-                os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
-            except Exception:
-                pass
-    # 혹시 남은 좀비 프로세스 강제 종료
-    subprocess.run(['pkill', '-f', 'realtime_detect.py'], capture_output=True)
-    subprocess.run(['pkill', '-f', 'cicflowmeter'], capture_output=True)
-    cic_proc = None
-    detect_proc = None
+    _kill_ips_subprocesses()
     return {"status": "stopped"}
 
 @app.get("/ips_status")
@@ -615,6 +877,10 @@ async def emergency_reset():
          'sudo iptables -F && sudo iptables -F FORWARD && sudo iptables -t nat -F'],
         capture_output=True
     )
+    # 메모리 내 차단 목록 + HTTP 카운터 + 에스컬레이션 상태 초기화
+    blocked_ips.clear()
+    http_attack_counts.clear()
+    high_response_time.clear()
     # DB 감시목록/차단목록 초기화
     conn = sqlite3.connect(DB_PATH)
     conn.execute('DELETE FROM watchlist')
