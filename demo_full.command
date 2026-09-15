@@ -4,10 +4,12 @@
 # 네트워크 탐지: LOW → MEDIUM → HIGH → CRITICAL
 # HTTP 탐지: SQLi / XSS → PF 차단
 # =========================================
-PYTHON=/opt/homebrew/Caskroom/miniforge/base/envs/ips_env/bin/python
+# 환경변수 IPS_PYTHON / IPS_ATTACK_TARGET / IPS_ATTACK_SRC 로 재정의 가능
+# (UBUNTU/HTTP_IP는 네트워크마다 바뀌므로 실행 환경에 맞게 override 권장)
+PYTHON="${IPS_PYTHON:-/opt/homebrew/Caskroom/miniforge/base/envs/ips_env/bin/python}"
 BASE_URL="http://localhost:8000"
-UBUNTU="192.168.45.6"   # Ubuntu 취약 서버 (현재 IP)
-HTTP_IP="192.168.45.135"  # Mac 공격자 IP (현재 네트워크)
+UBUNTU="${IPS_ATTACK_TARGET:-192.168.45.6}"     # Ubuntu 취약 서버 IP
+HTTP_IP="${IPS_ATTACK_SRC:-192.168.45.135}"     # Mac 공격자 IP
 
 echo "╔══════════════════════════════════════════╗"
 echo "║    AI 기반 IPS 시연 (단계별 대응)         ║"

@@ -1,8 +1,9 @@
 #!/bin/bash
 # IPS 시연용 공격 스크립트 (화면 녹화 전용)
-PYTHON=/opt/homebrew/Caskroom/miniforge/base/envs/ips_env/bin/python
+# 환경변수 IPS_PYTHON / IPS_UBUNTU_HOST 로 재정의 가능(미지정 시 기존 기본값)
+PYTHON="${IPS_PYTHON:-/opt/homebrew/Caskroom/miniforge/base/envs/ips_env/bin/python}"
 BASE_URL="http://localhost:8000"
-IP="192.168.64.10"
+IP="${IPS_UBUNTU_HOST:-192.168.64.10}"
 
 echo "================================================"
 echo "  IPS 시연 공격 스크립트"

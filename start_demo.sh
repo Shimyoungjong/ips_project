@@ -4,10 +4,14 @@
 # 탐지 시작은 대시보드 ▶ 버튼으로
 # =========================================
 
-UBUNTU="192.168.64.10"
-SSH="ssh -i /Users/shimyoungjong/.ssh/id_ed25519 -o StrictHostKeyChecking=no -o ConnectTimeout=5 hisecure@$UBUNTU"
-IPS_PYTHON="/opt/homebrew/Caskroom/miniforge/base/envs/ips_env/bin/python"
-IPS_DIR="$HOME/ips_project"
+# 환경변수로 재정의 가능(미지정 시 기존 기본값):
+#   IPS_UBUNTU_HOST, IPS_UBUNTU_USER, IPS_SSH_KEY, IPS_PYTHON, IPS_HOME
+UBUNTU="${IPS_UBUNTU_HOST:-192.168.64.10}"
+IPS_UBUNTU_USER="${IPS_UBUNTU_USER:-hisecure}"
+IPS_SSH_KEY="${IPS_SSH_KEY:-$HOME/.ssh/id_ed25519}"
+SSH="ssh -i $IPS_SSH_KEY -o StrictHostKeyChecking=no -o ConnectTimeout=5 $IPS_UBUNTU_USER@$UBUNTU"
+IPS_PYTHON="${IPS_PYTHON:-/opt/homebrew/Caskroom/miniforge/base/envs/ips_env/bin/python}"
+IPS_DIR="${IPS_HOME:-$HOME/ips_project}"
 
 echo "🔄 환경 초기화 중..."
 sudo bash "$IPS_DIR/demo_reset.sh"

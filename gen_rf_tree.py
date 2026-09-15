@@ -173,7 +173,8 @@ ax2.text(4, 0.56, '학습 데이터 408,000개 플로우 (6개 클래스)  |  �
          ha='center', va='center', fontproperties=fp(9.5), color='#B0C4D8', zorder=4)
 
 plt.tight_layout(pad=1.2)
-out = '/Users/shimyoungjong/ips_project/rf_decision_tree.png'
+_IPS_HOME = os.environ.get("IPS_HOME") or os.path.expanduser("~/ips_project")
+out = os.path.join(_IPS_HOME, "rf_decision_tree.png")
 plt.savefig(out, dpi=160, bbox_inches='tight', facecolor='#F0F4F8')
 print(f"Saved: {out}")
 plt.close()

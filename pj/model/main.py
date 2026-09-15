@@ -24,8 +24,19 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-DB_PATH    = os.path.expanduser("~/ips_project/ips_logs.db")
-MODEL_DIR  = os.path.expanduser("~/ips_project/models")
+# 환경변수로 재정의 가능. 미지정 시 기존 기본값과 동일하게 동작.
+#   IPS_HOME        : 프로젝트 루트 (기본 ~/ips_project)
+#   IPS_SSH_KEY     : Ubuntu 접속용 SSH 키 (기본 ~/.ssh/id_ed25519)
+#   IPS_UBUNTU_HOST : Ubuntu 호스트 (기본 192.168.64.10)
+#   IPS_UBUNTU_USER : Ubuntu 사용자 (기본 hisecure)
+#   IPS_PYTHON      : realtime_detect 실행용 Python (기본 miniforge ips_env)
+IPS_HOME   = os.environ.get("IPS_HOME") or os.path.expanduser("~/ips_project")
+SSH_KEY    = os.environ.get("IPS_SSH_KEY") or os.path.expanduser("~/.ssh/id_ed25519")
+UBUNTU_HOST = os.environ.get("IPS_UBUNTU_HOST", "192.168.64.10")
+UBUNTU_USER = os.environ.get("IPS_UBUNTU_USER", "hisecure")
+
+DB_PATH    = os.path.join(IPS_HOME, "ips_logs.db")
+MODEL_DIR  = os.path.join(IPS_HOME, "models")
 
 # 모델 로드
 model               = joblib.load(os.path.join(MODEL_DIR, 'rf_model.pkl'))
@@ -138,7 +149,7 @@ async def detect_ddos_middleware(request: Request, call_next):
     current_time = time.time()
 
     # 로컬호스트 및 우분투 서버는 DDoS 감지 제외
-    if client_ip in ('127.0.0.1', '::1', '192.168.64.10', '192.168.64.11'):
+    if client_ip in ('127.0.0.1', '::1', '192.168.64.10', '192.168.64.11', UBUNTU_HOST):
         return await call_next(request)
 
     # IP별 요청 카운트 계산
@@ -323,7 +334,7 @@ async def remove_watchlist(data: dict):
     conn.close()
     return {"status": "removed", "ip": ip}
 
-SSH_KEY = '/Users/shimyoungjong/.ssh/id_ed25519'
+# SSH_KEY는 파일 상단에서 IPS_SSH_KEY 환경변수 기준으로 정의됨
 
 def ubuntu_ssh(cmd):
     try:
@@ -331,7 +342,7 @@ def ubuntu_ssh(cmd):
             ['ssh', '-i', SSH_KEY,
              '-o', 'StrictHostKeyChecking=no', '-o', 'ConnectTimeout=3',
              '-o', 'BatchMode=yes', '-o', 'PasswordAuthentication=no',
-             'hisecure@192.168.64.10', cmd],
+             f'{UBUNTU_USER}@{UBUNTU_HOST}', cmd],
             capture_output=True, stdin=subprocess.DEVNULL, timeout=5
         )
     except Exception as e:
@@ -756,11 +767,12 @@ async def get_stats():
     return {"total": total, "attack": attack, "benign": benign, "status": "실시간 보호 중"}
 
 INTERFACE   = "en0"
-CSV_PATH    = os.path.expanduser("~/ips_project/captures/test.csv")
-CIC_PATH    = "/opt/homebrew/Caskroom/miniforge/base/envs/ips_env/bin/cicflowmeter"
-PYTHON_PATH = "/opt/homebrew/Caskroom/miniforge/base/envs/ips_env/bin/python"
-DETECT_PATH = os.path.expanduser("~/ips_project/realtime_detect.py")
-DETECT_LOG  = os.path.expanduser("~/ips_project/detect.log")
+_MINIFORGE_ENV = "/opt/homebrew/Caskroom/miniforge/base/envs/ips_env/bin"
+CSV_PATH    = os.path.join(IPS_HOME, "captures", "test.csv")
+CIC_PATH    = os.environ.get("IPS_CICFLOWMETER", f"{_MINIFORGE_ENV}/cicflowmeter")
+PYTHON_PATH = os.environ.get("IPS_PYTHON", f"{_MINIFORGE_ENV}/python")
+DETECT_PATH = os.path.join(IPS_HOME, "realtime_detect.py")
+DETECT_LOG  = os.path.join(IPS_HOME, "detect.log")
 
 cic_proc     = None
 detect_proc  = None
@@ -812,10 +824,10 @@ def clear_ubuntu_logs():
     """Ubuntu 허니팟/서버 로그 초기화"""
     try:
         subprocess.run(
-            ['ssh', '-i', '/Users/shimyoungjong/.ssh/id_ed25519',
+            ['ssh', '-i', SSH_KEY,
              '-o', 'StrictHostKeyChecking=no', '-o', 'ConnectTimeout=3',
              '-o', 'BatchMode=yes',
-             'hisecure@192.168.64.10',
+             f'{UBUNTU_USER}@{UBUNTU_HOST}',
              'truncate -s 0 /tmp/honeypot_log.txt 2>/dev/null; true'],
             capture_output=True, timeout=5
         )
@@ -838,7 +850,7 @@ async def start_ips():
     conn.commit()
     conn.close()
 
-    os.makedirs(os.path.expanduser("~/ips_project/captures"), exist_ok=True)
+    os.makedirs(os.path.join(IPS_HOME, "captures"), exist_ok=True)
     if os.path.exists(CSV_PATH):
         os.remove(CSV_PATH)
 
@@ -871,9 +883,9 @@ async def emergency_reset():
         subprocess.run(['/sbin/pfctl', '-t', table, '-T', 'flush'], capture_output=True)
     # Ubuntu iptables 초기화
     subprocess.run(
-        ['ssh', '-i', '/Users/shimyoungjong/.ssh/id_ed25519',
+        ['ssh', '-i', SSH_KEY,
          '-o', 'StrictHostKeyChecking=no', '-o', 'ConnectTimeout=3',
-         'hisecure@192.168.64.10',
+         f'{UBUNTU_USER}@{UBUNTU_HOST}',
          'sudo iptables -F && sudo iptables -F FORWARD && sudo iptables -t nat -F'],
         capture_output=True
     )

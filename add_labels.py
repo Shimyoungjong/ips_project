@@ -5,8 +5,12 @@ import subprocess
 import numpy as np
 
 # ==================== 설정 ====================
-CAPTURES_DIR = os.path.expanduser("~/ips_project/captures")
-OUTPUT_DIR = os.path.expanduser("~/ips_project/MachineLearningCSV")
+IPS_HOME = os.environ.get("IPS_HOME") or os.path.expanduser("~/ips_project")
+CAPTURES_DIR = os.path.join(IPS_HOME, "captures")
+OUTPUT_DIR = os.path.join(IPS_HOME, "MachineLearningCSV")
+_UBUNTU_HOST = os.environ.get("IPS_UBUNTU_HOST", "192.168.64.10")
+_UBUNTU_USER = os.environ.get("IPS_UBUNTU_USER", "hisecure")
+_SSH_KEY = os.environ.get("IPS_SSH_KEY") or os.path.expanduser("~/.ssh/id_ed25519")
 
 # IP 자동 감지
 def get_my_ip():
@@ -19,9 +23,9 @@ def get_my_ip():
 def get_ubuntu_ip():
     try:
         r = subprocess.run(
-            ['ssh', '-i', os.path.expanduser('~/.ssh/id_ed25519'),
+            ['ssh', '-i', _SSH_KEY,
              '-o', 'StrictHostKeyChecking=no', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=3',
-             'hisecure@192.168.64.10',
+             f'{_UBUNTU_USER}@{_UBUNTU_HOST}',
              "ip -4 addr show | grep 'inet ' | grep -v '192.168.64\\|127.0' | awk '{print $2}' | cut -d/ -f1"],
             capture_output=True, text=True, timeout=5
         )

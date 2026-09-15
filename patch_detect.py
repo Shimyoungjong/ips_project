@@ -2,7 +2,9 @@
 # Ubuntu에서 실행: python3 patch_detect.py
 # detect_attack() 함수에서 HTTP ML이 DDoS보다 먼저 실행되도록 수정
 
-path = '/root/ips_project/vulnerable_server/app.py'
+import os
+# Ubuntu 측 대상 파일 경로. 환경변수 IPS_TARGET_APP로 재정의 가능.
+path = os.environ.get("IPS_TARGET_APP", "/root/ips_project/vulnerable_server/app.py")
 
 with open(path, 'r', encoding='utf-8') as f:
     src = f.read()

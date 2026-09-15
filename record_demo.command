@@ -1,7 +1,9 @@
 #!/bin/bash
 # IPS 시연 화면 녹화 스크립트
+# 환경변수 IPS_HOME 로 재정의 가능(미지정 시 기존 기본값)
+IPS_HOME="${IPS_HOME:-$HOME/ips_project}"
 # 녹화 파일 저장 위치
-OUTPUT=~/ips_project/IPS_시연영상_$(date +%Y%m%d_%H%M%S).mov
+OUTPUT="$IPS_HOME/IPS_시연영상_$(date +%Y%m%d_%H%M%S).mov"
 
 echo "================================================"
 echo "  IPS 시연 화면 녹화"

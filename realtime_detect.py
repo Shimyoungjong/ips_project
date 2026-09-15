@@ -14,16 +14,24 @@ import signal
 from datetime import datetime, timedelta
 from scapy_flow import ScapyFlowCollector
 
-MODEL_DIR = os.path.expanduser("~/ips_project/models")
-CSV_PATH  = os.path.expanduser("~/ips_project/captures/test.csv")
-DB_PATH   = os.path.expanduser("~/ips_project/ips_logs.db")
+# ==================== 경로/환경 설정 ====================
+# 환경변수로 재정의 가능. 미지정 시 기존 기본값과 동일하게 동작.
+#   IPS_HOME        : 프로젝트 루트 (기본 ~/ips_project)
+#   IPS_SSH_KEY     : Ubuntu 접속용 SSH 키 (기본 ~/.ssh/id_ed25519)
+#   IPS_UBUNTU_HOST : Ubuntu 호스트 (기본 192.168.64.10)
+#   IPS_UBUNTU_USER : Ubuntu 사용자 (기본 hisecure)
+IPS_HOME  = os.environ.get("IPS_HOME") or os.path.expanduser("~/ips_project")
+
+MODEL_DIR = os.path.join(IPS_HOME, "models")
+CSV_PATH  = os.path.join(IPS_HOME, "captures", "test.csv")
+DB_PATH   = os.path.join(IPS_HOME, "ips_logs.db")
 
 # ==================== 설정 ====================
 FASTAPI_URL  = "http://localhost:8000/alert"
 WATCHLIST_URL = "http://localhost:8000/watchlist"
 ENABLE_DASHBOARD = True
 BLOCK_WINDOW_SECONDS = 300
-RULES_PATH = os.path.expanduser("~/ips_project/rules.json")
+RULES_PATH = os.path.join(IPS_HOME, "rules.json")
 
 import json
 
@@ -61,14 +69,15 @@ LEVEL_CRITICAL = 0.80
 HIGH_TO_CRITICAL_DELAY = 60
 DETECTION_THRESHOLD = {}
 
-EVIDENCE_DIR = os.path.expanduser("~/ips_project/evidence")
+EVIDENCE_DIR = os.path.join(IPS_HOME, "evidence")
 os.makedirs(EVIDENCE_DIR, exist_ok=True)
 
 # Ubuntu SSH 정보 (허니팟 iptables redirect용) - bridge100은 항상 고정
-UBUNTU_SSH_HOST      = '192.168.64.10'
-UBUNTU_SSH_USER      = 'hisecure'
+UBUNTU_SSH_HOST      = os.environ.get("IPS_UBUNTU_HOST", '192.168.64.10')
+UBUNTU_SSH_USER      = os.environ.get("IPS_UBUNTU_USER", 'hisecure')
 UBUNTU_REAL_PORT     = 5000
 UBUNTU_HONEYPOT_PORT = 9999
+SSH_KEY = os.environ.get("IPS_SSH_KEY") or os.path.expanduser("~/.ssh/id_ed25519")
 
 # ==================== IP 자동 감지 ====================
 def get_my_en0_ip():
@@ -85,7 +94,7 @@ def get_ubuntu_wifi_ip():
     """Ubuntu 현재 WiFi IP를 bridge100 SSH로 감지"""
     try:
         r = subprocess.run(
-            ['ssh', '-i', '/Users/shimyoungjong/.ssh/id_ed25519',
+            ['ssh', '-i', SSH_KEY,
              '-o', 'StrictHostKeyChecking=no', '-o', 'ConnectTimeout=3',
              '-o', 'BatchMode=yes',
              f'{UBUNTU_SSH_USER}@{UBUNTU_SSH_HOST}',
@@ -197,11 +206,11 @@ def reload_pf():
         # NAT: Ubuntu VM → 외부 인터넷
         'nat on en0 from 192.168.64.0/24 to any -> (en0)\n'
         # 허니팟 리다이렉트: highlist IP가 Mac:5000 → Ubuntu 허니팟:9999
-        'rdr on en0 proto tcp from <highlist> to any port 5000 -> 192.168.64.10 port 9999\n'
+        f'rdr on en0 proto tcp from <highlist> to any port 5000 -> {UBUNTU_SSH_HOST} port 9999\n'
         # 포트 포워드: 일반 트래픽 Mac:5000 → Ubuntu Flask:5000
-        'rdr on en0 proto tcp to (en0) port 5000 -> 192.168.64.10 port 5000\n'
+        f'rdr on en0 proto tcp to (en0) port 5000 -> {UBUNTU_SSH_HOST} port 5000\n'
         # bridge100 허니팟 리다이렉트 (내부 테스트용)
-        'rdr on bridge100 proto tcp from <highlist> to any port 5000 -> 192.168.64.10 port 9999\n'
+        f'rdr on bridge100 proto tcp from <highlist> to any port 5000 -> {UBUNTU_SSH_HOST} port 9999\n'
         'anchor "com.apple.internet-sharing" all\n'
         'block drop from <blocklist> to any\n'
         'pass in on en0 proto tcp from <throttlelist> to (en0) port 5000 '
@@ -235,7 +244,7 @@ def get_watchlist():
 def respond_low(ip):
     print(f"  📋 [LOW] {ip} → DB 정밀 기록 중")
 
-SSH_KEY = '/Users/shimyoungjong/.ssh/id_ed25519'
+# SSH_KEY는 파일 상단에서 IPS_SSH_KEY 환경변수 기준으로 정의됨
 
 def ubuntu_ssh(cmd):
     """Ubuntu에 SSH로 명령 실행"""
@@ -443,7 +452,7 @@ init_pf()
 
 
 # ==================== Scapy → RF 모델 콜백 ====================
-PROTECTED_IPS = {'192.168.64.10', '192.168.64.11'} | ({_ubuntu_ip} if _ubuntu_ip else set())
+PROTECTED_IPS = {'192.168.64.10', '192.168.64.11', UBUNTU_SSH_HOST} | ({_ubuntu_ip} if _ubuntu_ip else set())
 
 # 보호 대상(타겟) 명시 — 웹서버(5000)/허니팟(9999)으로 향하거나 그 응답인 플로우만 탐지 대상으로 삼음.
 # 이걸 두면 Mac 자체 트래픽이든 Ubuntu 관리 트래픽이든 "보호 자산"과 무관한 플로우는

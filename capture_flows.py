@@ -17,10 +17,11 @@ Ctrl+C 로 중지 → 자동 저장
 import sys, os, csv, time, signal, glob
 from datetime import datetime
 
-sys.path.insert(0, os.path.expanduser("~/ips_project"))
+IPS_HOME  = os.environ.get("IPS_HOME") or os.path.expanduser("~/ips_project")
+sys.path.insert(0, IPS_HOME)
 from scapy_flow import ScapyFlowCollector, FLOW_TIMEOUT
 
-CAPTURES  = os.path.expanduser("~/ips_project/captures")
+CAPTURES  = os.path.join(IPS_HOME, "captures")
 IFACE     = "en0"
 TARGET_FLOWS = 70000
 

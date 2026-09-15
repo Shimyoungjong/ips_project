@@ -11,8 +11,9 @@ from sklearn.metrics import classification_report, confusion_matrix
 import time
 
 # ==================== 설정 ====================
-DATA_DIR  = os.path.expanduser("~/ips_project/MachineLearningCSV")
-MODEL_DIR = os.path.expanduser("~/ips_project/models")
+IPS_HOME  = os.environ.get("IPS_HOME") or os.path.expanduser("~/ips_project")
+DATA_DIR  = os.path.join(IPS_HOME, "MachineLearningCSV")
+MODEL_DIR = os.path.join(IPS_HOME, "models")
 SAMPLE_PER_CLASS = 68000
 TEST_SIZE        = 0.25
 EXCLUDE_CLASSES  = []
