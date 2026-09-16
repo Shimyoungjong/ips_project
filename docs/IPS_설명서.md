@@ -341,7 +341,7 @@ python3 ~/honeypot_flask.py
 **Mac 터미널 1 - 백엔드:**
 ```bash
 cd ~/ips_project
-sudo /opt/homebrew/Caskroom/miniforge/base/envs/ips_env/bin/python -m uvicorn pj.model.main:app --host 0.0.0.0 --port 8000
+sudo -E .venv/bin/python -m uvicorn pj.model.main:app --host 0.0.0.0 --port 8000
 ```
 
 **Mac 터미널 2 - 대시보드:**

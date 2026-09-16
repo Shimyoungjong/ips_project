@@ -85,9 +85,11 @@ set -a; source .env; set +a
 |----------|--------|------|
 | `IPS_HOME` | `~/ips_project` | 프로젝트 루트 (DB·모델·캡처·증거·로그·rules.json 기준 경로) |
 | `IPS_SSH_KEY` | `~/.ssh/id_ed25519` | Ubuntu VM 접속용 SSH 개인키 경로 |
-| `IPS_UBUNTU_HOST` | `192.168.64.10` | Ubuntu VM 호스트(IP) |
+| `IPS_UBUNTU_HOST` | `192.168.64.10` | Ubuntu VM 호스트(IP) — VM마다 다르므로 확인 후 지정 |
 | `IPS_UBUNTU_USER` | `hisecure` | Ubuntu SSH 사용자명 |
-| `IPS_PYTHON` | miniforge `ips_env` 파이썬 | 시연 스크립트가 사용할 Python 실행 파일 |
+| `IPS_UBUNTU_IFACE` | `enp0s1` | Ubuntu 패킷 캡처 인터페이스 — 우분투에서 `ip a`로 확인 (버전마다 다름, 예: enp0s1/enp0s2/eth0) |
+| `IPS_IFACE` | `en0` | Mac 패킷 캡처 인터페이스 (`realtime_detect.py`) — 공격 트래픽이 실제로 지나가는 인터페이스로 지정 |
+| `IPS_PYTHON` | 프로젝트 `.venv` 파이썬 | 시연 스크립트가 백엔드(uvicorn) 실행에 사용할 Python. cicflowmeter는 더 이상 필요 없음(ScapyFlowCollector가 직접 캡처) |
 
 > 실제 SSH 키·비밀값은 저장소에 넣지 마세요. `.env`는 `.gitignore`에 포함되어 있습니다.
 
@@ -116,10 +118,11 @@ bash start_demo.sh
 # Ubuntu 측 (VM 안에서)
 cd ~/vulnerable_server && python3 app.py       # 취약 웹서버 (5000)
 python3 ~/honeypot_flask.py                     # 허니팟 (9999)
-sudo python3 ~/ubuntu_agent.py enp0s2           # 패킷 수집 에이전트
+ip a                                            # 실제 인터페이스명 확인 (enp0s1 등, 버전마다 다름)
+sudo python3 ~/ubuntu_agent.py <인터페이스명>    # 패킷 수집 에이전트
 
-# Mac 측
-sudo "$IPS_PYTHON" -m uvicorn pj.model.main:app --host 0.0.0.0 --port 8000  # 백엔드
+# Mac 측 (IPS_IFACE로 실제 캡처할 인터페이스 지정, 기본 en0)
+sudo IPS_IFACE=en0 "$IPS_PYTHON" -m uvicorn pj.model.main:app --host 0.0.0.0 --port 8000  # 백엔드
 cd pj/frontend && npm start                                                  # 대시보드 (3000)
 ```
 

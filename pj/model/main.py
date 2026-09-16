@@ -30,7 +30,9 @@ app.add_middleware(
 #   IPS_SSH_KEY     : Ubuntu 접속용 SSH 키 (기본 ~/.ssh/id_ed25519)
 #   IPS_UBUNTU_HOST : Ubuntu 호스트 (기본 192.168.64.10)
 #   IPS_UBUNTU_USER : Ubuntu 사용자 (기본 hisecure)
-#   IPS_PYTHON      : realtime_detect 실행용 Python (기본 miniforge ips_env)
+# (IPS_PYTHON은 main.py를 uvicorn으로 띄우는 실행 스크립트 쪽에서 쓰는 값이라 여기선 안 읽음.
+#  realtime_detect.py는 sys.executable로 지금 main.py를 실행 중인 인터프리터를 그대로 재사용하고,
+#  그 안의 캡처 인터페이스는 IPS_IFACE 환경변수로 재정의 가능(기본 en0).)
 IPS_HOME   = os.environ.get("IPS_HOME") or os.path.expanduser("~/ips_project")
 SSH_KEY    = os.environ.get("IPS_SSH_KEY") or os.path.expanduser("~/.ssh/id_ed25519")
 UBUNTU_HOST = os.environ.get("IPS_UBUNTU_HOST", "192.168.64.10")
@@ -767,11 +769,7 @@ async def get_stats():
     conn.close()
     return {"total": total, "attack": attack, "benign": benign, "status": "실시간 보호 중"}
 
-INTERFACE   = "en0"
-_MINIFORGE_ENV = "/opt/homebrew/Caskroom/miniforge/base/envs/ips_env/bin"
 CSV_PATH    = os.path.join(IPS_HOME, "captures", "test.csv")
-CIC_PATH    = os.environ.get("IPS_CICFLOWMETER", f"{_MINIFORGE_ENV}/cicflowmeter")
-PYTHON_PATH = os.environ.get("IPS_PYTHON", f"{_MINIFORGE_ENV}/python")
 DETECT_PATH = os.path.join(IPS_HOME, "realtime_detect.py")
 DETECT_LOG  = os.path.join(IPS_HOME, "detect.log")
 

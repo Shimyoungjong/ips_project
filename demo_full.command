@@ -6,7 +6,7 @@
 # =========================================
 # 환경변수 IPS_PYTHON / IPS_ATTACK_TARGET / IPS_ATTACK_SRC 로 재정의 가능
 # (UBUNTU/HTTP_IP는 네트워크마다 바뀌므로 실행 환경에 맞게 override 권장)
-PYTHON="${IPS_PYTHON:-/opt/homebrew/Caskroom/miniforge/base/envs/ips_env/bin/python}"
+PYTHON="${IPS_PYTHON:-$HOME/ips_project/.venv/bin/python}"
 BASE_URL="http://localhost:8000"
 UBUNTU="${IPS_ATTACK_TARGET:-192.168.45.6}"     # Ubuntu 취약 서버 IP
 HTTP_IP="${IPS_ATTACK_SRC:-192.168.45.135}"     # Mac 공격자 IP
