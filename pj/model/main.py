@@ -1,4 +1,5 @@
 import os
+import sys
 import signal
 import atexit
 import sqlite3
@@ -44,8 +45,8 @@ feature_names       = joblib.load(os.path.join(MODEL_DIR, 'feature_names.pkl'))
 http_model          = joblib.load(os.path.join(MODEL_DIR, 'rf_model_http.pkl'))
 http_feature_names  = joblib.load(os.path.join(MODEL_DIR, 'http_feature_names.pkl'))
 
-# 화이트리스트
-WHITELIST = ['192.168.100.160', '192.168.64.1', '127.0.0.1', '0.0.0.0', '172.20.10.2']
+# 화이트리스트 (Mac 관리 호스트 자신은 절대 차단/리다이렉트되지 않도록 보호)
+WHITELIST = ['192.168.64.1', '127.0.0.1', '0.0.0.0']
 AUTO_UNBLOCK_MINUTES = 10
 HTTP_BLOCK_THRESHOLD = 3       # 이 횟수 이상이면 PF 차단
 HTTP_BLOCK_WINDOW    = 30      # 초 단위 윈도우
@@ -837,8 +838,8 @@ def clear_ubuntu_logs():
 
 @app.post("/start")
 async def start_ips():
-    global cic_proc, detect_proc, session_start, server_logs
-    if cic_proc is not None:
+    global detect_proc, session_start, server_logs
+    if detect_proc is not None and detect_proc.poll() is None:
         return {"status": "already_running"}
 
     session_start = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
@@ -854,14 +855,13 @@ async def start_ips():
     if os.path.exists(CSV_PATH):
         os.remove(CSV_PATH)
 
-    cic_proc = subprocess.Popen(
-        ["sudo", CIC_PATH, "-i", INTERFACE, "-c", CSV_PATH],
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-        preexec_fn=os.setsid
-    )
+    # realtime_detect.py는 자체 ScapyFlowCollector로 패킷을 직접 캡처하므로
+    # cicflowmeter는 필요 없음(과거에 쓰던 CSV_PATH 경로는 이제 안 읽힘).
+    # sys.executable로 지금 main.py를 실행 중인 인터프리터를 그대로 재사용해서
+    # 예전 conda 환경 경로(IPS_PYTHON)에 더 이상 의존하지 않게 함.
     detect_log_f = open(DETECT_LOG, "w")
     detect_proc = subprocess.Popen(
-        ["sudo", PYTHON_PATH, "-u", DETECT_PATH],
+        ["sudo", sys.executable, "-u", DETECT_PATH],
         stdout=detect_log_f, stderr=detect_log_f,
         preexec_fn=os.setsid
     )
@@ -874,7 +874,7 @@ async def stop_ips():
 
 @app.get("/ips_status")
 async def ips_status():
-    return {"running": cic_proc is not None}
+    return {"running": detect_proc is not None and detect_proc.poll() is None}
 
 @app.post("/emergency_reset")
 async def emergency_reset():

@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useRef } from 'react';
 import axios from 'axios';
 import { ShieldAlert, Activity, BarChart3, Clock, Eye, Trash2 } from 'lucide-react';
-import bb, { bar } from 'billboard.js';
+import bb, { spline } from 'billboard.js';
 import 'billboard.js/dist/billboard.css';
 
 const ATTACK_COLORS = {
@@ -11,6 +11,17 @@ const ATTACK_COLORS = {
   SQLi:       '#eab308',
   XSS:        '#ec4899',
   Honeypot:   '#06b6d4',
+};
+
+const TIMELINE_BUCKET_MS = 10 * 1000;   // 10초 단위로 집계
+const TIMELINE_WINDOW_MS = 5 * 60 * 1000; // 최근 5분만 표시
+
+const bucketStart = (tsMs) => Math.floor(tsMs / TIMELINE_BUCKET_MS) * TIMELINE_BUCKET_MS;
+
+// 백엔드 타임스탬프 'YYYY-MM-DD HH:MM:SS' -> epoch ms (로컬 타임존 기준)
+const parseTimestamp = (ts) => {
+  const t = new Date(ts.replace(' ', 'T')).getTime();
+  return Number.isNaN(t) ? Date.now() : t;
 };
 
 const styles = {
@@ -44,12 +55,37 @@ function App() {
   const [currentTime, setCurrentTime] = useState(new Date().toLocaleTimeString());
   const [connected, setConnected] = useState(false);
   const [ipsRunning, setIpsRunning] = useState(false);
-  const [attackTypeCounts, setAttackTypeCounts] = useState({});
+  const [timeline, setTimeline] = useState([]); // [{ t: epochMs, counts: { SQLi: n, ... } }] - 창 전체를 빈틈없이 채운 배열
   const [watchlist, setWatchlist] = useState([]);
   const [blockedIps, setBlockedIps] = useState([]);
   const chartContainerRef = useRef(null);
   const chartInstanceRef = useRef(null);
-  const chartCategoriesRef = useRef([]);
+  const timelineSeededRef = useRef(false);
+  const bucketMapRef = useRef(new Map()); // 실제 이벤트만 저장하는 원본 데이터 (t -> { counts })
+
+  // bucketMapRef(실제 이벤트)를 기준으로, 최근 5분 창을 10초 간격으로 빈틈없이 채운 배열을 만들어 화면에 반영.
+  // 이게 없으면 이벤트가 드문드문 있을 때 그 사이가 그냥 직선으로 이어져서 꺾은선이 아니라 사선처럼 보임.
+  const rebuildTimeline = () => {
+    const now = Date.now();
+    const nowBucket = bucketStart(now);
+    const startBucket = nowBucket - TIMELINE_WINDOW_MS + TIMELINE_BUCKET_MS;
+    for (const key of bucketMapRef.current.keys()) {
+      if (key < startBucket) bucketMapRef.current.delete(key);
+    }
+    const arr = [];
+    for (let t = startBucket; t <= nowBucket; t += TIMELINE_BUCKET_MS) {
+      arr.push({ t, counts: bucketMapRef.current.get(t) || {} });
+    }
+    setTimeline(arr);
+  };
+
+  // 새 탐지 이벤트를 해당 시간 버킷에 누적
+  const addTimelineEvent = (attackType, tsMs) => {
+    const bStart = bucketStart(tsMs);
+    const counts = bucketMapRef.current.get(bStart) || {};
+    bucketMapRef.current.set(bStart, { ...counts, [attackType]: (counts[attackType] || 0) + 1 });
+    rebuildTimeline();
+  };
 
   useEffect(() => {
     const timer = setInterval(() => setCurrentTime(new Date().toLocaleTimeString()), 1000);
@@ -77,19 +113,32 @@ function App() {
 
   const fetchData = async () => {
     try {
-      const [logRes, statRes, statusRes, typeRes, serverLogRes] = await Promise.all([
+      const [logRes, statRes, statusRes, serverLogRes] = await Promise.all([
         axios.get('http://localhost:8000/logs'),
         axios.get('http://localhost:8000/stats'),
         axios.get('http://localhost:8000/ips_status'),
-        axios.get('http://localhost:8000/stats/by_type'),
         axios.get('http://localhost:8000/server_logs'),
       ]);
       setLogs(logRes.data);
       setStats(statRes.data);
       setIpsRunning(statusRes.data.running);
-      setAttackTypeCounts(typeRes.data);
       setServerLogs(serverLogRes.data.reverse());
       setConnected(true);
+
+      // 최초 로드 시 최근 5분 내 로그로 타임라인 초기값 구성 (이후엔 웹소켓으로만 갱신)
+      if (!timelineSeededRef.current) {
+        timelineSeededRef.current = true;
+        const now = Date.now();
+        for (const log of logRes.data) {
+          if (!log.is_attack) continue;
+          const tsMs = parseTimestamp(log.timestamp);
+          if (tsMs < now - TIMELINE_WINDOW_MS) continue;
+          const bStart = bucketStart(tsMs);
+          const counts = bucketMapRef.current.get(bStart) || {};
+          bucketMapRef.current.set(bStart, { ...counts, [log.attack_type]: (counts[log.attack_type] || 0) + 1 });
+        }
+        rebuildTimeline();
+      }
     } catch {
       setConnected(false);
     }
@@ -102,7 +151,9 @@ function App() {
     setLogs([]);
     setServerLogs([]);
     setWatchlist([]);
-    setAttackTypeCounts({});
+    bucketMapRef.current.clear();
+    setTimeline([]);
+    timelineSeededRef.current = true; // 시작 직후엔 과거 로그로 재시딩하지 않음
     setBlockedIps([]);
   };
 
@@ -122,19 +173,31 @@ function App() {
     fetchWatchlist();
   };
 
+  // 5분 창을 계속 앞으로 밀어주기 위해, 새 이벤트가 없어도 주기적으로 창을 다시 채움
   useEffect(() => {
-    const types = Object.keys(attackTypeCounts);
-    const counts = types.map((t) => attackTypeCounts[t]);
-    chartCategoriesRef.current = types;
+    const trimTimer = setInterval(rebuildTimeline, 10 * 1000);
+    return () => clearInterval(trimTimer);
+  }, []);
 
+  useEffect(() => {
     if (!chartContainerRef.current) return;
-    // 데이터가 아직 없으면(공격 0건) 차트 생성/갱신 자체를 건너뜀.
-    // billboard.js가 빈 데이터로 생성된 인스턴스에 .load()로 카테고리를 갱신할 때
-    // 내부 상태(isCategorized)가 비어 있어 크래시하는 버그가 있어서 회피.
-    if (types.length === 0) return;
 
-    // .load()로 카테고리(x축)까지 바꾸면 billboard.js 내부 상태가 깨지는 경우가 있어서,
-    // 매번 destroy 후 다시 generate하는 방식으로 안전하게 처리.
+    const types = [...new Set(timeline.flatMap(b => Object.keys(b.counts)))];
+
+    // 데이터가 아직 없으면(공격 0건) 차트 생성/갱신 자체를 건너뜀.
+    if (types.length === 0) {
+      if (chartInstanceRef.current) {
+        try { chartInstanceRef.current.destroy(); } catch (e) { /* 무시 */ }
+        chartInstanceRef.current = null;
+      }
+      return;
+    }
+
+    const xColumn = ['x', ...timeline.map(b => new Date(b.t))];
+    const typeColumns = types.map(t => [t, ...timeline.map(b => b.counts[t] || 0)]);
+    const colors = Object.fromEntries(types.map(t => [t, ATTACK_COLORS[t] || '#64748b']));
+
+    // 매번 destroy 후 다시 generate하는 방식으로 안전하게 처리 (기존 바 차트에서도 같은 이유로 사용).
     if (chartInstanceRef.current) {
       try {
         chartInstanceRef.current.destroy();
@@ -147,28 +210,30 @@ function App() {
     try {
       chartInstanceRef.current = bb.generate({
         bindto: chartContainerRef.current,
-        size: { height: 150 },
+        size: { height: 180 },
         data: {
-          columns: [['건수', ...counts]],
-          type: bar(),
-          color: (color, d) => {
-            if (d && typeof d.index === 'number') {
-              return ATTACK_COLORS[chartCategoriesRef.current[d.index]] || '#64748b';
-            }
-            return color;
+          x: 'x',
+          columns: [xColumn, ...typeColumns],
+          type: spline(),
+          colors,
+        },
+        point: { r: 2 },
+        axis: {
+          x: {
+            type: 'timeseries',
+            tick: { format: '%H:%M:%S', text: { style: { fill: '#94a3b8' } } },
+          },
+          y: {
+            tick: { format: (v) => Math.round(v), text: { style: { fill: '#94a3b8' } } },
+            min: 0,
+            padding: { bottom: 0 },
           },
         },
-        bar: { radius: { ratio: 0.25 } },
-        axis: {
-          x: { type: 'category', categories: types, tick: { text: { style: { fill: '#94a3b8' } } } },
-          y: { tick: { format: (v) => Math.round(v), text: { style: { fill: '#94a3b8' } } } },
-        },
-        legend: { show: false },
+        legend: { show: true, position: 'bottom' },
         grid: { y: { show: false } },
         tooltip: {
           format: {
-            title: () => '',
-            name: (name, ratio, id, index) => chartCategoriesRef.current[index] || name,
+            title: (x) => new Date(x).toLocaleTimeString(),
             value: (value) => `${value}건`,
           },
         },
@@ -176,7 +241,7 @@ function App() {
     } catch (e) {
       console.error('차트 생성 실패:', e);
     }
-  }, [attackTypeCounts]);
+  }, [timeline]);
 
   useEffect(() => {
     return () => {
@@ -223,10 +288,7 @@ function App() {
           return;
         }
         if (newLog.is_attack === true || newLog.is_attack === 1) {
-          setAttackTypeCounts(prev => ({
-            ...prev,
-            [newLog.attack_type]: (prev[newLog.attack_type] || 0) + 1
-          }));
+          addTimelineEvent(newLog.attack_type, parseTimestamp(newLog.timestamp));
           if (newLog.attack_type === 'Honeypot') {
             fetchWatchlist();
           }
@@ -322,10 +384,10 @@ function App() {
 
       <div style={{ ...styles.card, marginBottom: '20px' }}>
         <div style={{ display: 'flex', alignItems: 'center', gap: '10px', color: '#94a3b8', marginBottom: '15px' }}>
-          <BarChart3 size={20} /> 공격 유형별 탐지 건수
+          <BarChart3 size={20} /> 공격 유형별 탐지 추이 (최근 5분)
         </div>
         <div style={{ position: 'relative', width: '100%' }}>
-          {Object.keys(attackTypeCounts).length === 0 && (
+          {timeline.length === 0 && (
             <div style={{
               position: 'absolute', inset: 0, display: 'flex', flexDirection: 'column',
               alignItems: 'center', justifyContent: 'center', color: '#475569', gap: '8px', zIndex: 1,
@@ -336,7 +398,7 @@ function App() {
           )}
           <div
             ref={chartContainerRef}
-            style={{ width: '100%', height: '150px', visibility: Object.keys(attackTypeCounts).length === 0 ? 'hidden' : 'visible' }}
+            style={{ width: '100%', height: '180px', visibility: timeline.length === 0 ? 'hidden' : 'visible' }}
           />
         </div>
       </div>

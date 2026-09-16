@@ -597,7 +597,7 @@ def _agent_server_thread():
 threading.Thread(target=_agent_server_thread, daemon=True).start()
 
 # ==================== Scapy 플로우 수집기 시작 ====================
-flow_collector = ScapyFlowCollector(iface='en0', callback=on_flow_complete)
+flow_collector = ScapyFlowCollector(iface=os.environ.get('IPS_IFACE', 'en0'), callback=on_flow_complete)
 flow_collector.start()
 print("✅ Scapy 플로우 수집기 시작! (en0 전체 트래픽 → RF 모델 탐지)")
 
