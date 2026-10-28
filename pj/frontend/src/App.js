@@ -1,8 +1,9 @@
 import React, { useState, useEffect, useRef } from 'react';
 import axios from 'axios';
-import { ShieldAlert, Activity, BarChart3, Clock, Eye, Trash2 } from 'lucide-react';
-import bb, { spline } from 'billboard.js';
+import { ShieldAlert, Activity, BarChart3, Clock, Eye, Trash2, Ban, PieChart, Server, ChevronDown, ChevronUp } from 'lucide-react';
+import bb, { spline, donut } from 'billboard.js';
 import 'billboard.js/dist/billboard.css';
+import './App.css';
 
 const ATTACK_COLORS = {
   BruteForce: '#f97316',
@@ -11,6 +12,8 @@ const ATTACK_COLORS = {
   SQLi:       '#eab308',
   XSS:        '#ec4899',
   Honeypot:   '#06b6d4',
+  CMDi:       '#84cc16',
+  PathTraversal: '#14b8a6',
 };
 
 const TIMELINE_BUCKET_MS = 10 * 1000;   // 10초 단위로 집계
@@ -24,22 +27,49 @@ const parseTimestamp = (ts) => {
   return Number.isNaN(t) ? Date.now() : t;
 };
 
+// 모델 신뢰도 -> 위협 레벨 (백엔드 main.py의 LEVEL_MEDIUM/HIGH/CRITICAL과 동일하게 유지)
+const LEVEL_MEDIUM = 0.55;
+const LEVEL_HIGH = 0.65;
+const LEVEL_CRITICAL = 0.80;
+const LEVELS = {
+  critical: { label: 'Critical', color: '#f43f5e' },
+  high:     { label: 'High',     color: '#f97316' },
+  medium:   { label: 'Medium',   color: '#eab308' },
+  low:      { label: 'Low',      color: '#22c55e' },
+  benign:   { label: '정상',      color: '#64748b' },
+  suspicious: { label: '미분류',   color: '#a78bfa' }, // 흐름 모델 신뢰도 낮음 — 학습에 없는 공격일 수 있음
+};
+const threatLevel = (log) => {
+  if (log.attack_type === 'Suspicious') return 'suspicious';
+  if (!log.is_attack) return 'benign';
+  if (log.confidence >= LEVEL_CRITICAL) return 'critical';
+  if (log.confidence >= LEVEL_HIGH) return 'high';
+  if (log.confidence >= LEVEL_MEDIUM) return 'medium';
+  return 'low';
+};
+
+const ROW_HIGHLIGHT_MS = 2000; // 새 탐지 행 하이라이트 유지 시간
+
 const styles = {
-  container: { padding: '30px', backgroundColor: '#0f172a', minHeight: '100vh', color: '#f1f5f9', fontFamily: "'Pretendard', sans-serif" },
-  header: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '30px', borderBottom: '1px solid #334155', paddingBottom: '20px' },
-  grid: { display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: '20px', marginBottom: '20px', alignItems: 'stretch' },
-  card: { backgroundColor: '#1e293b', padding: '28px 32px', borderRadius: '16px', border: '1px solid #334155', boxShadow: '0 4px 6px -1px rgba(0, 0, 0, 0.1)' },
-  tableSection: { backgroundColor: '#1e293b', borderRadius: '16px', border: '1px solid #334155', overflow: 'hidden', marginBottom: '20px' },
+  container: { padding: '24px 28px', backgroundColor: '#0f172a', minHeight: '100vh', color: '#f1f5f9', fontFamily: "'Pretendard', sans-serif", boxSizing: 'border-box' },
+  header: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: '12px', marginBottom: '20px', borderBottom: '1px solid #334155', paddingBottom: '16px' },
+  card: { backgroundColor: '#1e293b', padding: '20px 24px', borderRadius: '16px', border: '1px solid #334155', boxShadow: '0 4px 6px -1px rgba(0, 0, 0, 0.1)', minWidth: 0 },
+  cardTitle: { display: 'flex', alignItems: 'center', gap: '10px', color: '#94a3b8', fontSize: '14px', fontWeight: 'bold' },
+  kpiValue: (color) => ({ fontSize: '34px', fontWeight: 'bold', color, marginTop: '8px', lineHeight: 1.1 }),
+  kpiSub: { fontSize: '12px', color: '#64748b', marginTop: '6px' },
+  panel: { backgroundColor: '#1e293b', borderRadius: '16px', border: '1px solid #334155', overflow: 'hidden', display: 'flex', flexDirection: 'column', minWidth: 0 },
+  panelHeader: { padding: '14px 20px', borderBottom: '1px solid #334155', fontWeight: 'bold', display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: '8px' },
+  panelHint: { fontSize: '12px', color: '#64748b', fontWeight: 'normal' },
   table: { width: '100%', borderCollapse: 'collapse' },
-  th: { backgroundColor: '#334155', padding: '15px', textAlign: 'left', fontSize: '14px', color: '#94a3b8' },
-  td: { padding: '15px', borderBottom: '1px solid #334155', fontSize: '14px' },
-  badge: (blocked) => ({ padding: '4px 10px', borderRadius: '20px', fontSize: '12px', fontWeight: 'bold', backgroundColor: blocked ? '#166534' : '#991b1b', color: '#f8fafc' }),
-  tabBar: { display: 'flex', gap: '8px', marginBottom: '20px' },
-  tab: (active) => ({
-    padding: '8px 20px', borderRadius: '8px', border: 'none', cursor: 'pointer', fontSize: '14px', fontWeight: 'bold',
-    backgroundColor: active ? '#3b82f6' : '#334155',
-    color: active ? '#fff' : '#94a3b8',
-  }),
+  th: { position: 'sticky', top: 0, zIndex: 1, backgroundColor: '#334155', padding: '10px 14px', textAlign: 'left', fontSize: '13px', color: '#94a3b8' },
+  td: { padding: '10px 14px', borderBottom: '1px solid #334155', fontSize: '14px' },
+  badge: (blocked) => ({ padding: '4px 10px', borderRadius: '20px', fontSize: '12px', fontWeight: 'bold', backgroundColor: blocked ? '#166534' : '#991b1b', color: '#f8fafc', whiteSpace: 'nowrap' }),
+  countBadge: (bg) => ({ backgroundColor: bg, color: '#fff', borderRadius: '10px', padding: '1px 8px', fontSize: '12px' }),
+  listItem: { padding: '12px 20px', borderBottom: '1px solid #334155' },
+  empty: { padding: '28px', textAlign: 'center', color: '#475569', fontSize: '14px' },
+  smallBtn: (color) => ({ padding: '3px 9px', borderRadius: '6px', border: '1px solid #475569', background: 'none', color, cursor: 'pointer', fontSize: '12px' }),
+  headerBtn: (bg, color = '#fff') => ({ padding: '8px 18px', borderRadius: '8px', border: 'none', backgroundColor: bg, color, fontWeight: 'bold', cursor: 'pointer', fontSize: '14px' }),
+  pill: (bg, color) => ({ display: 'inline-flex', alignItems: 'center', gap: '6px', fontSize: '12px', fontWeight: 'normal', padding: '4px 10px', borderRadius: '20px', backgroundColor: bg, color }),
   threatBadge: (level) => {
     const colors = { high: '#7f1d1d', medium: '#78350f', low: '#14532d', critical: '#4c0519' };
     const textColors = { high: '#fca5a5', medium: '#fcd34d', low: '#86efac', critical: '#f9a8d4' };
@@ -48,7 +78,8 @@ const styles = {
 };
 
 function App() {
-  const [tab, setTab] = useState('logs');
+  const [serverLogsOpen, setServerLogsOpen] = useState(true);
+  const [flashKey, setFlashKey] = useState(0); // Critical 탐지 때마다 증가 -> 경고 오버레이 재생
   const [logs, setLogs] = useState([]);
   const [serverLogs, setServerLogs] = useState([]);
   const [stats, setStats] = useState({ total: 0, benign: 0, attack: 0, status: "연결 대기 중..." });
@@ -60,6 +91,10 @@ function App() {
   const [blockedIps, setBlockedIps] = useState([]);
   const chartContainerRef = useRef(null);
   const chartInstanceRef = useRef(null);
+  const donutContainerRef = useRef(null);
+  const donutInstanceRef = useRef(null);
+  const rowArrivedRef = useRef(new Map()); // 로그 행 key -> 처음 화면에 나타난 시각 (하이라이트용)
+  const logsSeededRef = useRef(false);     // 최초 로드분은 하이라이트하지 않음
   const timelineSeededRef = useRef(false);
   const bucketMapRef = useRef(new Map()); // 실제 이벤트만 저장하는 원본 데이터 (t -> { counts })
 
@@ -210,7 +245,7 @@ function App() {
     try {
       chartInstanceRef.current = bb.generate({
         bindto: chartContainerRef.current,
-        size: { height: 180 },
+        size: { height: 200 },
         data: {
           x: 'x',
           columns: [xColumn, ...typeColumns],
@@ -243,14 +278,59 @@ function App() {
     }
   }, [timeline]);
 
+  // 공격 유형 비율 도넛 (추이 차트와 같은 최근 5분 데이터 기준)
+  useEffect(() => {
+    if (!donutContainerRef.current) return;
+
+    const totals = {};
+    for (const b of timeline) {
+      for (const [t, n] of Object.entries(b.counts)) totals[t] = (totals[t] || 0) + n;
+    }
+    const types = Object.keys(totals);
+    const sum = types.reduce((s, t) => s + totals[t], 0);
+
+    if (donutInstanceRef.current) {
+      try { donutInstanceRef.current.destroy(); } catch (e) { /* 무시 */ }
+      donutInstanceRef.current = null;
+    }
+    if (sum === 0) return;
+
+    try {
+      donutInstanceRef.current = bb.generate({
+        bindto: donutContainerRef.current,
+        size: { height: 200 },
+        data: {
+          columns: types.map(t => [t, totals[t]]),
+          type: donut(),
+          colors: Object.fromEntries(types.map(t => [t, ATTACK_COLORS[t] || '#64748b'])),
+        },
+        donut: { title: `${sum}건`, width: 28, label: { show: false } },
+        legend: { show: true, position: 'right' },
+        tooltip: { format: { value: (v, ratio) => `${v}건 (${(ratio * 100).toFixed(0)}%)` } },
+        transition: { duration: 0 },
+      });
+    } catch (e) {
+      console.error('도넛 차트 생성 실패:', e);
+    }
+  }, [timeline]);
+
   useEffect(() => {
     return () => {
       if (chartInstanceRef.current) {
         chartInstanceRef.current.destroy();
         chartInstanceRef.current = null;
       }
+      if (donutInstanceRef.current) {
+        donutInstanceRef.current.destroy();
+        donutInstanceRef.current = null;
+      }
     };
   }, []);
+
+  // 첫 로드로 받은 로그가 그려진 뒤부터 새로 들어오는 행만 하이라이트
+  useEffect(() => {
+    if (connected) logsSeededRef.current = true;
+  }, [logs, connected]);
 
   const enableNotifications = () => {
     Notification.requestPermission().then(perm => {
@@ -289,6 +369,7 @@ function App() {
         }
         if (newLog.is_attack === true || newLog.is_attack === 1) {
           addTimelineEvent(newLog.attack_type, parseTimestamp(newLog.timestamp));
+          if (newLog.confidence >= LEVEL_CRITICAL) setFlashKey(k => k + 1);
           if (newLog.attack_type === 'Honeypot') {
             fetchWatchlist();
           }
@@ -298,7 +379,7 @@ function App() {
               icon: '/favicon.ico'
             });
             fetchBlockedIps();
-          } else if (newLog.confidence >= 0.9 && Notification.permission === 'granted') {
+          } else if (newLog.confidence >= LEVEL_CRITICAL && Notification.permission === 'granted') {
             new Notification('🔴 Critical 공격 탐지!', {
               body: `${newLog.attack_type} | IP: ${newLog.attacker_ip}`,
               icon: '/favicon.ico'
@@ -325,274 +406,288 @@ function App() {
     };
   }, []);
 
+  // 위협 피드 행: 안정적인 key를 만들고, 처음 나타난 지 얼마 안 된 행은 하이라이트
+  const now = Date.now();
+  const seenKeys = {};
+  const feedRows = logs.map((log) => {
+    const base = `${log.timestamp}|${log.attacker_ip}|${log.attack_type}`;
+    seenKeys[base] = (seenKeys[base] || 0) + 1;
+    const key = `${base}|${seenKeys[base]}`;
+    if (!rowArrivedRef.current.has(key)) rowArrivedRef.current.set(key, logsSeededRef.current ? now : 0);
+    return { log, key, isNew: now - rowArrivedRef.current.get(key) < ROW_HIGHLIGHT_MS };
+  });
+  if (rowArrivedRef.current.size > 500) {
+    const live = new Set(feedRows.map(r => r.key));
+    for (const k of rowArrivedRef.current.keys()) if (!live.has(k)) rowArrivedRef.current.delete(k);
+  }
+
+  const hasAttacks = timeline.some(b => Object.keys(b.counts).length > 0);
+  const attackRatio = stats.total > 0 ? ((stats.attack / stats.total) * 100).toFixed(1) : null;
+  const pendingReview = blockedIps.filter(b => !b.reviewed && !b.permanent).length;
+
+  const emptyChart = (Icon, text) => (
+    <div style={{
+      position: 'absolute', inset: 0, display: 'flex', flexDirection: 'column',
+      alignItems: 'center', justifyContent: 'center', color: '#475569', gap: '8px', zIndex: 1,
+    }}>
+      <Icon size={32} color="#334155" />
+      <span style={{ fontSize: '14px' }}>{text}</span>
+    </div>
+  );
+
   return (
     <div style={styles.container}>
+      {flashKey > 0 && <div key={flashKey} className="critical-flash" />}
+
       <header style={styles.header}>
-        <h1 style={{ display: 'flex', alignItems: 'center', gap: '12px', margin: 0 }}>
+        <h1 style={{ display: 'flex', alignItems: 'center', gap: '12px', margin: 0, fontSize: '26px', flexWrap: 'wrap' }}>
           <ShieldAlert size={32} color="#3b82f6" /> AI 기반 차세대 실시간 IPS
-          <span style={{
-            fontSize: '12px', fontWeight: 'normal', padding: '3px 10px',
-            borderRadius: '20px', marginLeft: '8px',
-            backgroundColor: connected ? '#166534' : '#7f1d1d',
-            color: connected ? '#86efac' : '#fca5a5'
-          }}>
+          {ipsRunning ? (
+            <span style={styles.pill('#14532d', '#86efac')}><span className="pulse-dot" /> 실시간 보호 중</span>
+          ) : (
+            <span style={styles.pill('#334155', '#94a3b8')}>■ 중지됨</span>
+          )}
+          <span style={connected ? styles.pill('#1e3a5f', '#93c5fd') : styles.pill('#7f1d1d', '#fca5a5')}>
             {connected ? '● 백엔드 연결됨' : '● 연결 끊김'}
           </span>
         </h1>
-        <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: '10px', flexWrap: 'wrap' }}>
           {ipsRunning ? (
-            <button onClick={handleStop} style={{ padding: '8px 20px', borderRadius: '8px', border: 'none', backgroundColor: '#ef4444', color: '#fff', fontWeight: 'bold', cursor: 'pointer', fontSize: '14px' }}>
-              ■ 중지
-            </button>
+            <button onClick={handleStop} style={styles.headerBtn('#ef4444')}>■ 중지</button>
           ) : (
-            <button onClick={handleStart} style={{ padding: '8px 20px', borderRadius: '8px', border: 'none', backgroundColor: '#22c55e', color: '#fff', fontWeight: 'bold', cursor: 'pointer', fontSize: '14px' }}>
-              ▶ 시작
-            </button>
+            <button onClick={handleStart} style={styles.headerBtn('#22c55e')}>▶ 시작</button>
           )}
-          <button onClick={handleEmergencyReset} style={{ padding: '8px 20px', borderRadius: '8px', border: 'none', backgroundColor: '#f59e0b', color: '#fff', fontWeight: 'bold', cursor: 'pointer', fontSize: '14px' }}>
-            🚨 긴급 해제
-          </button>
-          <button onClick={enableNotifications} style={{ padding: '8px 16px', borderRadius: '8px', border: 'none', backgroundColor: '#334155', color: '#94a3b8', cursor: 'pointer', fontSize: '13px' }}>
-            🔔 알림 허용
-          </button>
-          <div style={{ display: 'flex', alignItems: 'center', gap: '8px', color: '#94a3b8' }}>
+          <button onClick={handleEmergencyReset} style={styles.headerBtn('#f59e0b')}>🚨 긴급 해제</button>
+          <button onClick={enableNotifications} style={{ ...styles.headerBtn('#334155', '#94a3b8'), fontWeight: 'normal', fontSize: '13px' }}>🔔 알림 허용</button>
+          <div style={{ display: 'flex', alignItems: 'center', gap: '8px', color: '#94a3b8', fontVariantNumeric: 'tabular-nums' }}>
             <Clock size={18} /> {currentTime}
           </div>
         </div>
       </header>
 
-      <div style={styles.grid}>
+      {/* KPI */}
+      <div className="kpi-row">
         <div style={styles.card}>
-          <div style={{ display: 'flex', alignItems: 'center', gap: '10px', color: '#94a3b8', marginBottom: '10px' }}>
-            <Activity size={20} /> 전체 탐지 건수
-          </div>
-          <div style={{ fontSize: '36px', fontWeight: 'bold', color: '#f1f5f9' }}>{stats.total} <span style={{fontSize: '18px'}}>건</span></div>
+          <div style={styles.cardTitle}><Activity size={18} /> 전체 탐지</div>
+          <div style={styles.kpiValue('#f1f5f9')}>{stats.total.toLocaleString()} <span style={{ fontSize: '16px' }}>건</span></div>
+          <div style={styles.kpiSub}>정상 {stats.benign.toLocaleString()}건</div>
         </div>
         <div style={styles.card}>
-          <div style={{ display: 'flex', alignItems: 'center', gap: '10px', color: '#94a3b8', marginBottom: '10px' }}>
-            <ShieldAlert size={20} /> 공격 탐지
-          </div>
-          <div style={{ fontSize: '36px', fontWeight: 'bold', color: '#ef4444' }}>{stats.attack} <span style={{fontSize: '18px'}}>건</span></div>
+          <div style={styles.cardTitle}><ShieldAlert size={18} /> 공격 탐지</div>
+          <div style={styles.kpiValue('#ef4444')}>{stats.attack.toLocaleString()} <span style={{ fontSize: '16px' }}>건</span></div>
+          <div style={styles.kpiSub}>{attackRatio !== null ? `전체 트래픽의 ${attackRatio}%` : '—'}</div>
         </div>
         <div style={styles.card}>
-          <div style={{ display: 'flex', alignItems: 'center', gap: '10px', color: '#94a3b8', marginBottom: '10px' }}>
-            <Eye size={20} /> 감시목록
-          </div>
-          <div style={{ fontSize: '36px', fontWeight: 'bold', color: '#06b6d4' }}>{watchlist.length} <span style={{fontSize: '18px'}}>IP</span></div>
+          <div style={styles.cardTitle}><Ban size={18} /> 차단 IP</div>
+          <div style={styles.kpiValue('#f43f5e')}>{blockedIps.length} <span style={{ fontSize: '16px' }}>IP</span></div>
+          <div style={styles.kpiSub}>{pendingReview > 0 ? `관리자 검토 대기 ${pendingReview}건` : '검토 대기 없음'}</div>
+        </div>
+        <div style={styles.card}>
+          <div style={styles.cardTitle}><Eye size={18} /> 감시목록</div>
+          <div style={styles.kpiValue('#06b6d4')}>{watchlist.length} <span style={{ fontSize: '16px' }}>IP</span></div>
+          <div style={styles.kpiSub}>허니팟·반복 공격 자동 등록</div>
         </div>
       </div>
 
-      <div style={{ ...styles.card, marginBottom: '20px' }}>
-        <div style={{ display: 'flex', alignItems: 'center', gap: '10px', color: '#94a3b8', marginBottom: '15px' }}>
-          <BarChart3 size={20} /> 공격 유형별 탐지 추이 (최근 5분)
+      {/* 차트 */}
+      <div className="dash-row">
+        <div style={styles.card}>
+          <div style={{ ...styles.cardTitle, marginBottom: '12px' }}><BarChart3 size={18} /> 공격 유형별 탐지 추이 (최근 5분)</div>
+          <div style={{ position: 'relative', width: '100%' }}>
+            {!hasAttacks && emptyChart(BarChart3, '탐지된 공격 없음')}
+            <div ref={chartContainerRef} style={{ width: '100%', height: '200px', visibility: hasAttacks ? 'visible' : 'hidden' }} />
+          </div>
         </div>
-        <div style={{ position: 'relative', width: '100%' }}>
-          {timeline.length === 0 && (
-            <div style={{
-              position: 'absolute', inset: 0, display: 'flex', flexDirection: 'column',
-              alignItems: 'center', justifyContent: 'center', color: '#475569', gap: '8px', zIndex: 1,
-            }}>
-              <BarChart3 size={32} color="#334155" />
-              <span style={{ fontSize: '14px' }}>탐지된 공격 없음</span>
-            </div>
-          )}
-          <div
-            ref={chartContainerRef}
-            style={{ width: '100%', height: '180px', visibility: timeline.length === 0 ? 'hidden' : 'visible' }}
-          />
+        <div style={styles.card}>
+          <div style={{ ...styles.cardTitle, marginBottom: '12px' }}><PieChart size={18} /> 공격 유형 비율 (최근 5분)</div>
+          <div style={{ position: 'relative', width: '100%' }}>
+            {!hasAttacks && emptyChart(PieChart, '데이터 없음')}
+            <div ref={donutContainerRef} style={{ width: '100%', height: '200px', visibility: hasAttacks ? 'visible' : 'hidden' }} />
+          </div>
         </div>
       </div>
 
-      {/* 탭 */}
-      <div style={styles.tabBar}>
-        <button style={styles.tab(tab === 'logs')} onClick={() => setTab('logs')}>📍 실시간 위협 로그</button>
-        <button style={styles.tab(tab === 'server_logs')} onClick={() => setTab('server_logs')}>🖥️ 서버 접속 로그</button>
-        <button style={styles.tab(tab === 'watchlist')} onClick={() => setTab('watchlist')}>
-          👁 감시목록 {watchlist.length > 0 && <span style={{ marginLeft: '6px', backgroundColor: '#06b6d4', color: '#fff', borderRadius: '10px', padding: '1px 7px', fontSize: '11px' }}>{watchlist.length}</span>}
-        </button>
-        <button style={styles.tab(tab === 'blocked')} onClick={() => setTab('blocked')}>
-          🚫 차단 관리 {blockedIps.length > 0 && <span style={{ marginLeft: '6px', backgroundColor: '#ef4444', color: '#fff', borderRadius: '10px', padding: '1px 7px', fontSize: '11px' }}>{blockedIps.length}</span>}
-        </button>
-      </div>
-
-      {tab === 'logs' && (
-        <section style={styles.tableSection}>
-          <div style={{ padding: '20px', borderBottom: '1px solid #334155', fontWeight: 'bold' }}>📍 실시간 보안 위협 로그</div>
-          <table style={styles.table}>
-            <thead>
-              <tr>
-                <th style={styles.th}>공격 유형</th>
-                <th style={styles.th}>공격자 IP</th>
-                <th style={styles.th}>탐지 시간</th>
-                <th style={styles.th}>위협 레벨</th>
-                <th style={styles.th}>방어 상태</th>
-              </tr>
-            </thead>
-            <tbody>
-              {logs.length === 0 ? (
+      {/* 위협 피드 + 차단/감시 */}
+      <div className="dash-row">
+        <section style={styles.panel}>
+          <div style={styles.panelHeader}>
+            <span>📍 실시간 위협 피드</span>
+            <span style={styles.panelHint}>최근 50건 · ML 모델 판정</span>
+          </div>
+          <div className="scroll-y" style={{ maxHeight: '460px' }}>
+            <table style={styles.table}>
+              <thead>
                 <tr>
-                  <td colSpan={5} style={{ ...styles.td, textAlign: 'center', padding: '48px', color: '#475569' }}>
-                    <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '10px' }}>
-                      <ShieldAlert size={36} color="#334155" />
-                      <span style={{ fontSize: '15px' }}>탐지된 위협 없음</span>
-                      <span style={{ fontSize: '12px', color: '#334155' }}>IPS가 실행되면 탐지 로그가 여기에 표시됩니다</span>
-                    </div>
-                  </td>
+                  <th style={styles.th}>탐지 시간</th>
+                  <th style={styles.th}>공격 유형</th>
+                  <th style={styles.th}>공격자 IP</th>
+                  <th style={styles.th}>모델 신뢰도</th>
+                  <th style={styles.th}>방어 상태</th>
                 </tr>
-              ) : logs.map((log, index) => (
-                <tr key={index}>
-                  <td style={{ ...styles.td, color: log.is_attack ? '#ef4444' : '#22c55e', fontWeight: 'bold' }}>{log.attack_type}</td>
-                  <td style={styles.td}>{log.attacker_ip}</td>
-                  <td style={styles.td}>{log.timestamp}</td>
-                  <td style={styles.td}>{
-                    !log.is_attack ? '✅ 정상' :
-                    log.confidence >= 0.9 ? '🔴 Critical' :
-                    log.confidence >= 0.75 ? '🟠 High' :
-                    log.confidence >= 0.6 ? '🟡 Medium' : '🟢 Low'
-                  }</td>
-                  <td style={styles.td}><span style={styles.badge(log.blocked)}>{log.blocked ? "차단 완료" : "탐지됨"}</span></td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </section>
-      )}
-
-      {tab === 'server_logs' && (
-        <section style={styles.tableSection}>
-          <div style={{ padding: '20px', borderBottom: '1px solid #334155', fontWeight: 'bold' }}>🖥️ 서버 접속 로그 (실제 서버 / 허니팟)</div>
-          <table style={styles.table}>
-            <thead>
-              <tr>
-                <th style={styles.th}>서버</th>
-                <th style={styles.th}>IP</th>
-                <th style={styles.th}>메서드</th>
-                <th style={styles.th}>경로</th>
-                <th style={styles.th}>페이로드</th>
-                <th style={styles.th}>시각</th>
-              </tr>
-            </thead>
-            <tbody>
-              {serverLogs.length === 0 ? (
-                <tr><td colSpan={6} style={{ ...styles.td, textAlign: 'center', color: '#475569' }}>접속 기록 없음</td></tr>
-              ) : serverLogs.map((log, i) => (
-                <tr key={i}>
-                  <td style={styles.td}>
-                    <span style={{ padding: '3px 8px', borderRadius: '12px', fontSize: '12px', fontWeight: 'bold',
-                      backgroundColor: log.server_type === 'honeypot' ? '#164e63' : '#14532d',
-                      color: log.server_type === 'honeypot' ? '#67e8f9' : '#86efac' }}>
-                      {log.server_type === 'honeypot' ? '🍯 허니팟' : '🌐 실제'}
-                    </span>
-                  </td>
-                  <td style={{ ...styles.td, fontFamily: 'monospace', color: '#f97316' }}>{log.ip}</td>
-                  <td style={styles.td}>{log.method}</td>
-                  <td style={{ ...styles.td, fontFamily: 'monospace', color: '#94a3b8' }}>{log.path}</td>
-                  <td style={{ ...styles.td, color: log.payload ? '#eab308' : '#475569', maxWidth: '200px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                    {log.payload || '-'}
-                  </td>
-                  <td style={styles.td}>{log.timestamp}</td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </section>
-      )}
-
-      {tab === 'watchlist' && (
-        <section style={styles.tableSection}>
-          <div style={{ padding: '20px', borderBottom: '1px solid #334155', fontWeight: 'bold', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-            <span>👁 감시목록 — 허니팟/반복 공격 IP 자동 등록</span>
-            <span style={{ fontSize: '13px', color: '#94a3b8' }}>신뢰도 +20% 가중 적용</span>
+              </thead>
+              <tbody>
+                {feedRows.length === 0 ? (
+                  <tr>
+                    <td colSpan={5} style={{ ...styles.td, textAlign: 'center', padding: '48px', color: '#475569' }}>
+                      <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '10px' }}>
+                        <ShieldAlert size={36} color="#334155" />
+                        <span style={{ fontSize: '15px' }}>탐지된 위협 없음</span>
+                        <span style={{ fontSize: '12px', color: '#334155' }}>IPS가 실행되면 탐지 로그가 여기에 표시됩니다</span>
+                      </div>
+                    </td>
+                  </tr>
+                ) : feedRows.map(({ log, key, isNew }) => {
+                  const level = LEVELS[threatLevel(log)];
+                  const pct = Math.round((log.confidence || 0) * 100);
+                  return (
+                    <tr key={key} className={isNew ? 'row-new' : undefined}>
+                      <td style={{ ...styles.td, color: '#94a3b8', fontVariantNumeric: 'tabular-nums', whiteSpace: 'nowrap' }}>{log.timestamp}</td>
+                      <td style={styles.td}>
+                        <span style={{ display: 'inline-flex', alignItems: 'center', gap: '8px', fontWeight: 'bold', color: log.is_attack ? '#f1f5f9' : log.attack_type === 'Suspicious' ? level.color : '#22c55e' }}>
+                          <span style={{ width: '8px', height: '8px', borderRadius: '50%', backgroundColor: log.is_attack ? (ATTACK_COLORS[log.attack_type] || '#64748b') : log.attack_type === 'Suspicious' ? level.color : '#22c55e' }} />
+                          {log.attack_type === 'Suspicious' ? '미분류 의심' : log.attack_type}
+                        </span>
+                      </td>
+                      <td style={{ ...styles.td, fontFamily: 'monospace' }}>{log.attacker_ip}</td>
+                      <td style={styles.td}>
+                        <div style={{ display: 'flex', alignItems: 'center', gap: '8px', minWidth: '150px' }}>
+                          <div style={{ flex: 1, height: '6px', borderRadius: '3px', backgroundColor: '#334155', overflow: 'hidden' }}>
+                            <div style={{ width: `${pct}%`, height: '100%', backgroundColor: level.color }} />
+                          </div>
+                          <span style={{ fontSize: '12px', color: level.color, fontWeight: 'bold', width: '84px', fontVariantNumeric: 'tabular-nums' }}>
+                            {pct}% {level.label}
+                          </span>
+                        </div>
+                      </td>
+                      <td style={styles.td}><span style={styles.badge(log.blocked)}>{log.blocked ? '차단 완료' : '탐지됨'}</span></td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
           </div>
-          <table style={styles.table}>
-            <thead>
-              <tr>
-                <th style={styles.th}>IP 주소</th>
-                <th style={styles.th}>등록 사유</th>
-                <th style={styles.th}>위협 레벨</th>
-                <th style={styles.th}>등록 시각</th>
-                <th style={styles.th}>관리</th>
-              </tr>
-            </thead>
-            <tbody>
-              {watchlist.length === 0 ? (
-                <tr><td colSpan={5} style={{ ...styles.td, textAlign: 'center', color: '#475569' }}>감시 중인 IP 없음</td></tr>
-              ) : watchlist.map((item) => (
-                <tr key={item.id}>
-                  <td style={{ ...styles.td, fontFamily: 'monospace', color: '#06b6d4' }}>{item.ip}</td>
-                  <td style={styles.td}>{item.reason}</td>
-                  <td style={styles.td}><span style={styles.threatBadge(item.threat_level)}>{item.threat_level.toUpperCase()}</span></td>
-                  <td style={styles.td}>{item.added_at}</td>
-                  <td style={styles.td}>
-                    <button
-                      onClick={() => handleRemoveWatchlist(item.ip)}
-                      style={{ background: 'none', border: '1px solid #475569', borderRadius: '6px', padding: '4px 8px', cursor: 'pointer', color: '#ef4444' }}
-                    >
-                      <Trash2 size={14} />
-                    </button>
-                  </td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
         </section>
-      )}
 
-      {tab === 'blocked' && (
-        <section style={styles.tableSection}>
-          <div style={{ padding: '20px', borderBottom: '1px solid #334155', fontWeight: 'bold', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-            <span>🚫 차단된 IP — 관리자 검토 대기</span>
-            <span style={{ fontSize: '13px', color: '#94a3b8' }}>기본 10분 후 자동 해제 (영구 차단 선택 시 제외)</span>
-          </div>
-          <table style={styles.table}>
-            <thead>
-              <tr>
-                <th style={styles.th}>IP 주소</th>
-                <th style={styles.th}>공격 유형</th>
-                <th style={styles.th}>차단 시각</th>
-                <th style={styles.th}>상태</th>
-                <th style={styles.th}>자동 해제 시각</th>
-                <th style={styles.th}>관리자 조치</th>
-              </tr>
-            </thead>
-            <tbody>
+        <div style={{ display: 'flex', flexDirection: 'column', gap: '20px', minWidth: 0 }}>
+          <section style={styles.panel}>
+            <div style={styles.panelHeader}>
+              <span style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                🚫 차단 관리 {blockedIps.length > 0 && <span style={styles.countBadge('#ef4444')}>{blockedIps.length}</span>}
+              </span>
+              <span style={styles.panelHint}>기본 10분 후 자동 해제</span>
+            </div>
+            <div className="scroll-y" style={{ maxHeight: '250px' }}>
               {blockedIps.length === 0 ? (
-                <tr><td colSpan={6} style={{ ...styles.td, textAlign: 'center', color: '#475569' }}>현재 차단된 IP 없음</td></tr>
+                <div style={styles.empty}>현재 차단된 IP 없음</div>
               ) : blockedIps.map((item) => (
-                <tr key={item.id}>
-                  <td style={{ ...styles.td, fontFamily: 'monospace', color: '#ef4444' }}>{item.ip}</td>
-                  <td style={styles.td}>{item.attack_type}</td>
-                  <td style={styles.td}>{item.blocked_at}</td>
-                  <td style={styles.td}>
+                <div key={item.id} style={styles.listItem}>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: '8px' }}>
+                    <span style={{ fontFamily: 'monospace', color: '#ef4444', fontWeight: 'bold' }}>{item.ip}</span>
                     {item.permanent
                       ? <span style={styles.threatBadge('critical')}>영구 차단</span>
                       : item.reviewed
                         ? <span style={styles.threatBadge('medium')}>검토 완료(10분)</span>
                         : <span style={styles.threatBadge('high')}>검토 대기</span>}
-                  </td>
-                  <td style={styles.td}>{item.permanent ? '—' : item.auto_unblock_at}</td>
-                  <td style={styles.td}>
-                    <div style={{ display: 'flex', gap: '6px' }}>
-                      <button
-                        onClick={() => handleBlockedDecision(item.ip, 'keep_10min')}
-                        style={{ padding: '4px 10px', borderRadius: '6px', border: '1px solid #475569', background: 'none', color: '#fcd34d', cursor: 'pointer', fontSize: '12px' }}
-                      >10분 유지</button>
-                      <button
-                        onClick={() => handleBlockedDecision(item.ip, 'permanent')}
-                        style={{ padding: '4px 10px', borderRadius: '6px', border: '1px solid #475569', background: 'none', color: '#f9a8d4', cursor: 'pointer', fontSize: '12px' }}
-                      >영구 차단</button>
-                      <button
-                        onClick={() => handleBlockedDecision(item.ip, 'unblock')}
-                        style={{ padding: '4px 10px', borderRadius: '6px', border: '1px solid #475569', background: 'none', color: '#86efac', cursor: 'pointer', fontSize: '12px' }}
-                      >즉시 해제</button>
-                    </div>
-                  </td>
-                </tr>
+                  </div>
+                  <div style={{ fontSize: '12px', color: '#94a3b8', margin: '6px 0 8px' }}>
+                    {item.attack_type} · {item.blocked_at}{!item.permanent && ` → ${item.auto_unblock_at} 해제`}
+                  </div>
+                  <div style={{ display: 'flex', gap: '6px', flexWrap: 'wrap' }}>
+                    <button onClick={() => handleBlockedDecision(item.ip, 'keep_10min')} style={styles.smallBtn('#fcd34d')}>10분 유지</button>
+                    <button onClick={() => handleBlockedDecision(item.ip, 'permanent')} style={styles.smallBtn('#f9a8d4')}>영구 차단</button>
+                    <button onClick={() => handleBlockedDecision(item.ip, 'unblock')} style={styles.smallBtn('#86efac')}>즉시 해제</button>
+                  </div>
+                </div>
               ))}
-            </tbody>
-          </table>
-        </section>
-      )}
+            </div>
+          </section>
+
+          <section style={{ ...styles.panel, flex: 1 }}>
+            <div style={styles.panelHeader}>
+              <span style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                👁 감시목록 {watchlist.length > 0 && <span style={styles.countBadge('#06b6d4')}>{watchlist.length}</span>}
+              </span>
+              <span style={styles.panelHint}>신뢰도 +20% 가중 적용</span>
+            </div>
+            <div className="scroll-y" style={{ maxHeight: '200px' }}>
+              {watchlist.length === 0 ? (
+                <div style={styles.empty}>감시 중인 IP 없음</div>
+              ) : watchlist.map((item) => (
+                <div key={item.id} style={{ ...styles.listItem, display: 'flex', alignItems: 'center', gap: '10px' }}>
+                  <div style={{ flex: 1, minWidth: 0 }}>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                      <span style={{ fontFamily: 'monospace', color: '#06b6d4', fontWeight: 'bold' }}>{item.ip}</span>
+                      <span style={styles.threatBadge(item.threat_level)}>{item.threat_level.toUpperCase()}</span>
+                    </div>
+                    <div style={{ fontSize: '12px', color: '#94a3b8', marginTop: '4px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                      {item.reason} · {item.added_at}
+                    </div>
+                  </div>
+                  <button
+                    onClick={() => handleRemoveWatchlist(item.ip)}
+                    title="감시목록에서 제거"
+                    style={{ background: 'none', border: '1px solid #475569', borderRadius: '6px', padding: '4px 8px', cursor: 'pointer', color: '#ef4444' }}
+                  >
+                    <Trash2 size={14} />
+                  </button>
+                </div>
+              ))}
+            </div>
+          </section>
+        </div>
+      </div>
+
+      {/* 서버 접속 로그 */}
+      <section style={styles.panel}>
+        <div
+          style={{ ...styles.panelHeader, cursor: 'pointer', borderBottom: serverLogsOpen ? styles.panelHeader.borderBottom : 'none' }}
+          onClick={() => setServerLogsOpen(o => !o)}
+        >
+          <span style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+            <Server size={16} /> 서버 접속 로그 (실제 서버 / 허니팟)
+            {serverLogs.length > 0 && <span style={styles.countBadge('#475569')}>{serverLogs.length}</span>}
+          </span>
+          {serverLogsOpen ? <ChevronUp size={18} color="#94a3b8" /> : <ChevronDown size={18} color="#94a3b8" />}
+        </div>
+        {serverLogsOpen && (
+          <div className="scroll-y" style={{ maxHeight: '300px' }}>
+            <table style={styles.table}>
+              <thead>
+                <tr>
+                  <th style={styles.th}>서버</th>
+                  <th style={styles.th}>IP</th>
+                  <th style={styles.th}>메서드</th>
+                  <th style={styles.th}>경로</th>
+                  <th style={styles.th}>페이로드</th>
+                  <th style={styles.th}>시각</th>
+                </tr>
+              </thead>
+              <tbody>
+                {serverLogs.length === 0 ? (
+                  <tr><td colSpan={6} style={{ ...styles.td, textAlign: 'center', color: '#475569' }}>접속 기록 없음</td></tr>
+                ) : serverLogs.map((log, i) => (
+                  <tr key={i}>
+                    <td style={styles.td}>
+                      <span style={{ padding: '3px 8px', borderRadius: '12px', fontSize: '12px', fontWeight: 'bold',
+                        backgroundColor: log.server_type === 'honeypot' ? '#164e63' : '#14532d',
+                        color: log.server_type === 'honeypot' ? '#67e8f9' : '#86efac' }}>
+                        {log.server_type === 'honeypot' ? '🍯 허니팟' : '🌐 실제'}
+                      </span>
+                    </td>
+                    <td style={{ ...styles.td, fontFamily: 'monospace', color: '#f97316' }}>{log.ip}</td>
+                    <td style={styles.td}>{log.method}</td>
+                    <td style={{ ...styles.td, fontFamily: 'monospace', color: '#94a3b8' }}>{log.path}</td>
+                    <td style={{ ...styles.td, color: log.payload ? '#eab308' : '#475569', maxWidth: '260px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                      {log.payload || '-'}
+                    </td>
+                    <td style={{ ...styles.td, whiteSpace: 'nowrap' }}>{log.timestamp}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </section>
     </div>
   );
 }

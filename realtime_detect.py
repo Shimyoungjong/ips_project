@@ -77,6 +77,7 @@ UBUNTU_SSH_HOST      = os.environ.get("IPS_UBUNTU_HOST", '192.168.64.10')
 UBUNTU_SSH_USER      = os.environ.get("IPS_UBUNTU_USER", 'hisecure')
 UBUNTU_REAL_PORT     = 5000
 UBUNTU_HONEYPOT_PORT = 9999
+UBUNTU_SSH_PORT      = 22    # SSH 브루트포스(patator/hydra) 탐지용
 SSH_KEY = os.environ.get("IPS_SSH_KEY") or os.path.expanduser("~/.ssh/id_ed25519")
 
 # ==================== IP 자동 감지 ====================
@@ -441,9 +442,11 @@ def send_to_dashboard(attack_type, attacker_ip, confidence, is_attack, blocked):
         pass
 
 # ==================== 모델 로드 ====================
-model               = joblib.load(os.path.join(MODEL_DIR, 'rf_model.pkl'))
-feature_names       = joblib.load(os.path.join(MODEL_DIR, 'feature_names.pkl'))
-classes             = joblib.load(os.path.join(MODEL_DIR, 'classes.pkl'))
+# 하이브리드 모델(CIC-IDS-2017 improved + 직접 캡처) — compare_flow_models.py, 피처·클래스는 _public 파일과 동일
+# 직접 캡처 데이터 모델로 되돌리려면 rf_model.pkl / feature_names.pkl / classes.pkl 로 변경
+model               = joblib.load(os.path.join(MODEL_DIR, 'rf_model_hybrid.pkl'))
+feature_names       = joblib.load(os.path.join(MODEL_DIR, 'feature_names_public.pkl'))
+classes             = joblib.load(os.path.join(MODEL_DIR, 'classes_public.pkl'))
 print("✅ 모델 로드 완료!")
 print(f"✅ 탐지 클래스: {list(classes)}")
 
@@ -454,10 +457,11 @@ init_pf()
 # ==================== Scapy → RF 모델 콜백 ====================
 PROTECTED_IPS = {'192.168.64.10', '192.168.64.11', UBUNTU_SSH_HOST} | ({_ubuntu_ip} if _ubuntu_ip else set())
 
-# 보호 대상(타겟) 명시 — 웹서버(5000)/허니팟(9999)으로 향하거나 그 응답인 플로우만 탐지 대상으로 삼음.
+# 보호 대상(타겟) 명시 — 웹서버(5000)/허니팟(9999)/SSH(22)로 향하거나 그 응답인 플로우만 탐지 대상으로 삼음.
+# (IPS가 Ubuntu에 iptables 명령을 보내는 SSH는 출발지 192.168.64.1이 화이트리스트라 판정에서 빠짐)
 # 이걸 두면 Mac 자체 트래픽이든 Ubuntu 관리 트래픽이든 "보호 자산"과 무관한 플로우는
 # 캡처 소스(en0 / ubuntu_agent)가 뭐든 상관없이 애초에 모델 판정 자체를 안 함.
-PROTECT_TARGET_PORTS = {UBUNTU_REAL_PORT, UBUNTU_HONEYPOT_PORT}
+PROTECT_TARGET_PORTS = {UBUNTU_REAL_PORT, UBUNTU_HONEYPOT_PORT, UBUNTU_SSH_PORT}
 
 def on_flow_complete(features):
     """ScapyFlowCollector 콜백: 완료된 플로우 → RF 모델 탐지"""
@@ -499,6 +503,12 @@ def on_flow_complete(features):
         pred = model.predict(X)[0]
         conf = float(model.predict_proba(X)[0].max())
 
+        # SQLi/XSS는 패킷 통계만으로 판단하기엔 근거가 약해 오탐이 잦음
+        # (실제 페이로드 내용은 /detect_http의 HTTP 텍스트 기반 모델이 훨씬 정확하게 잡음).
+        # 흐름 모델은 DDoS/PortScan/BruteForce 판정에만 쓰고, SQLi/XSS 판정은 무시함.
+        if pred in ('SQLi', 'XSS'):
+            pred = 'BENIGN'
+
         # 공격자 IP 결정 (보호 대상이 src이면 dst가 공격자)
         if src_ip in PROTECTED_IPS and dst_ip not in ('unknown', ''):
             attacker_ip = dst_ip
@@ -524,6 +534,12 @@ def on_flow_complete(features):
         # 이미 차단된 IP → 조용히 DROP (로그/대시보드 미기록)
         if attacker_ip in blocked_ips:
             print(f"  🚫 [DROP] {attacker_ip} 이미 차단된 IP — 플로우 무시")
+            return
+
+        # 모델이 확신하지 못하는 흐름은 학습에 없는 공격일 수 있음 → 차단 없이 '미분류 의심'으로 표시만
+        if conf < LEVEL_CRITICAL:
+            save_log('Suspicious', attacker_ip, conf, False, False)
+            send_to_dashboard('Suspicious', attacker_ip, conf, False, False)
             return
 
         threshold = DETECTION_THRESHOLD.get(pred, LEVEL_HIGH)

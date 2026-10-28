@@ -42,10 +42,11 @@ DB_PATH    = os.path.join(IPS_HOME, "ips_logs.db")
 MODEL_DIR  = os.path.join(IPS_HOME, "models")
 
 # 모델 로드
-model               = joblib.load(os.path.join(MODEL_DIR, 'rf_model.pkl'))
-feature_names       = joblib.load(os.path.join(MODEL_DIR, 'feature_names.pkl'))
-http_model          = joblib.load(os.path.join(MODEL_DIR, 'rf_model_http.pkl'))
-http_feature_names  = joblib.load(os.path.join(MODEL_DIR, 'http_feature_names.pkl'))
+# 흐름 모델: 하이브리드(CIC-IDS-2017 improved + 직접 캡처, compare_flow_models.py) — 피처·클래스는 _public 파일과 동일. 되돌리려면 rf_model.pkl / feature_names.pkl
+model               = joblib.load(os.path.join(MODEL_DIR, 'rf_model_hybrid.pkl'))
+feature_names       = joblib.load(os.path.join(MODEL_DIR, 'feature_names_public.pkl'))
+http_model          = joblib.load(os.path.join(MODEL_DIR, 'rf_model_http_v4.pkl'))
+http_feature_names  = joblib.load(os.path.join(MODEL_DIR, 'http_feature_names_v4.pkl'))
 
 # 화이트리스트 (Mac 관리 호스트 자신은 절대 차단/리다이렉트되지 않도록 보호)
 WHITELIST = ['192.168.64.1', '127.0.0.1', '0.0.0.0']
@@ -206,7 +207,7 @@ async def receive_alert(data: AlertData):
         return {"status": "blocked_skip"}
 
     # ── HTTP 공격 횟수 카운트 → 임계치(3회/30초) 초과 시 PF 차단 ──
-    count = check_http_count(data.attacker_ip)
+    count = check_http_count(data.attacker_ip) if data.is_attack else 0  # '미분류 의심'(is_attack=False)은 차단 횟수에서 제외
     actually_blocked = False
     if count >= HTTP_BLOCK_THRESHOLD:
         actually_blocked = block_ip(data.attacker_ip, data.attack_type)
@@ -445,16 +446,19 @@ def apply_threat_response(ip: str, conf: float, attack_type: str):
         return "whitelist", False
 
     now = time.time()
-    watchlisted = is_watchlisted(ip)
     blocked = False
 
     if conf >= LEVEL_CRITICAL:
-        if watchlisted or (ip in high_response_time and (now - high_response_time[ip]) >= HIGH_TO_CRITICAL_DELAY):
+        # HIGH 대응 후 실제로 HIGH_TO_CRITICAL_DELAY초가 지나서도 다시 공격이 오면(=지속적인 공격)
+        # CRITICAL로 승격. 감시목록에 있다는 사실만으로, 또는 직후 바로 이어지는 두 번째 공격
+        # 유형(SQLi 넣고 XSS 넣는 등)만으로 즉시 완전차단하지 않도록 시간 조건을 실제로 지킴.
+        if ip in high_response_time and (now - high_response_time[ip]) >= HIGH_TO_CRITICAL_DELAY:
             blocked = respond_critical(ip, attack_type)
             level = "critical"
         else:
             respond_high(ip)
-            high_response_time[ip] = now - HIGH_TO_CRITICAL_DELAY  # 다음번엔 바로 CRITICAL 발동
+            if ip not in high_response_time:
+                high_response_time[ip] = now
             level = "high"
     elif conf >= LEVEL_HIGH:
         respond_high(ip)
@@ -859,7 +863,7 @@ async def start_ips():
     # 예전 conda 환경 경로(IPS_PYTHON)에 더 이상 의존하지 않게 함.
     detect_log_f = open(DETECT_LOG, "w")
     detect_proc = subprocess.Popen(
-        ["sudo", sys.executable, "-u", DETECT_PATH],
+        ["sudo", "-E", sys.executable, "-u", DETECT_PATH],
         stdout=detect_log_f, stderr=detect_log_f,
         preexec_fn=os.setsid
     )

@@ -1,5 +1,5 @@
 {
-  "block_threshold": 1,
+  "block_threshold": 3,
   "level_low": 0.40,
   "level_medium": 0.55,
   "level_high": 0.65,

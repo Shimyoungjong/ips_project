@@ -76,3 +76,7 @@ Thumbs.db
 
 # ===== 작업 중 임시 폴더 =====
 _claude_trash/
+
+# ===== 외부 공개 데이터셋 (용량 큼 / 재배포 안 함, 출처는 학습 스크립트 참고) =====
+public_dataset/
+http_dataset/fwaf/
