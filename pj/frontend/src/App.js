@@ -1,9 +1,10 @@
 import React, { useState, useEffect, useRef } from 'react';
 import axios from 'axios';
-import { ShieldAlert, Activity, BarChart3, Clock, Eye, Trash2, Ban, PieChart, Server, ChevronDown, ChevronUp } from 'lucide-react';
+import { ShieldAlert, Activity, BarChart3, Clock, Eye, Trash2, Ban, PieChart, Server, ChevronDown, ChevronUp, Lightbulb, Brain, X } from 'lucide-react';
 import bb, { spline, donut } from 'billboard.js';
 import 'billboard.js/dist/billboard.css';
 import './App.css';
+import { MODELS, FLOW_COMPARISON, CONFUSION, RESPONSE_LEVELS, modelOf } from './modelInfo';
 
 const ATTACK_COLORS = {
   BruteForce: '#f97316',
@@ -48,6 +49,34 @@ const threatLevel = (log) => {
   return 'low';
 };
 
+// 사이드바 메뉴 = 페이지. 주소 해시(#/blocked 등)로 페이지를 구분해 뒤로 가기·직접 링크가 동작
+const PAGES = [
+  { id: 'overview', label: '개요', icon: PieChart },
+  { id: 'events', label: '탐지 로그', icon: BarChart3 },
+  { id: 'advice', label: '대응 권고', icon: Lightbulb },
+  { id: 'model', label: '모델 정보', icon: Brain },
+  { id: 'blocked', label: '차단 관리', icon: Ban },
+  { id: 'watchlist', label: '감시목록', icon: Eye },
+  { id: 'server', label: '서버 로그', icon: Server },
+];
+// 공격 유형별 대응 권고 (탐지 결과에 맞춰 표시하는 정해진 권고문)
+const ADVICE = {
+  SQLi: { risk: 'high', desc: '입력값에 SQL 구문을 넣어 DB를 조회·변조하는 공격', actions: ['SQL 쿼리를 파라미터 바인딩(Prepared Statement)으로 작성', '입력값 길이·형식 검증과 특수문자 처리', 'DB 계정 권한 최소화, DB 오류 메시지 노출 차단'] },
+  XSS: { risk: 'high', desc: '페이지에 악성 스크립트를 심어 사용자 브라우저에서 실행시키는 공격', actions: ['출력할 때 HTML 이스케이프 적용', 'Content-Security-Policy(CSP) 헤더 설정', '쿠키에 HttpOnly·Secure 속성 지정'] },
+  DDoS: { risk: 'high', desc: '대량의 요청으로 서비스를 마비시키는 공격', actions: ['출발지 IP별 요청 속도 제한(rate limit)', '반복 공격 IP 차단 유지, 상위 방화벽·CDN 차단 요청', '연결 타임아웃·동시 연결 수 상한 조정'] },
+  PortScan: { risk: 'medium', desc: '열린 포트를 찾아 다음 공격을 준비하는 정찰 행위', actions: ['서비스에 필요 없는 포트 닫기', '스캔 IP를 감시목록에 올려 후속 공격 주시', '외부에 노출되는 서비스 버전 정보 숨기기'] },
+  BruteForce: { risk: 'high', desc: '비밀번호를 반복 대입해 로그인하려는 공격', actions: ['로그인 실패 횟수 제한과 일시 잠금', 'SSH는 키 인증 사용, 관리자 로그인에 2단계 인증 적용', '기본 계정명·약한 비밀번호 변경'] },
+  CMDi: { risk: 'high', desc: '입력값으로 서버 운영체제 명령을 실행시키는 공격', actions: ['사용자 입력을 셸 명령에 직접 넣지 않기', '허용 목록 기반 입력 검증', '웹 서버 실행 계정 권한 최소화'] },
+  PathTraversal: { risk: 'medium', desc: '../ 등으로 허용되지 않은 파일에 접근하는 공격', actions: ['경로를 정규화한 뒤 허용 디렉터리 안인지 확인', '사용자 입력으로 파일명을 직접 지정하지 않기', '민감 파일 접근 권한 제한'] },
+  Honeypot: { risk: 'medium', desc: '허니팟에 접근한 IP — 공격 의도가 높은 대상', actions: ['해당 IP 감시목록 유지, 정상 서버 접근 시 즉시 차단 검토', '허니팟 로그로 공격 패턴 분석'] },
+};
+const ADVICE_DEFAULT = { risk: 'medium', desc: '분류된 공격 유형', actions: ['해당 IP 접근 기록 확인', '반복 시 차단 유지 검토'] };
+
+const pageFromHash = () => {
+  const id = window.location.hash.replace('#/', '');
+  return PAGES.some(pg => pg.id === id) ? id : 'overview';
+};
+
 const ROW_HIGHLIGHT_MS = 2000; // 새 탐지 행 하이라이트 유지 시간
 
 const styles = {
@@ -79,7 +108,8 @@ const styles = {
 
 function App() {
   const [serverLogsOpen, setServerLogsOpen] = useState(true);
-  const [flashKey, setFlashKey] = useState(0); // Critical 탐지 때마다 증가 -> 경고 오버레이 재생
+  const [page, setPage] = useState(pageFromHash);
+  const [unacked, setUnacked] = useState(0); // 확인 안 한 Critical 경고 수 (0보다 크면 테두리가 계속 깜박임)
   const [logs, setLogs] = useState([]);
   const [serverLogs, setServerLogs] = useState([]);
   const [stats, setStats] = useState({ total: 0, benign: 0, attack: 0, status: "연결 대기 중..." });
@@ -89,10 +119,13 @@ function App() {
   const [timeline, setTimeline] = useState([]); // [{ t: epochMs, counts: { SQLi: n, ... } }] - 창 전체를 빈틈없이 채운 배열
   const [watchlist, setWatchlist] = useState([]);
   const [blockedIps, setBlockedIps] = useState([]);
+  const [typeCounts, setTypeCounts] = useState({}); // 유형별 공격 탐지 건수 (/stats/by_type)
+  const [selected, setSelected] = useState(null); // 상세 모달에 띄운 탐지 항목
   const chartContainerRef = useRef(null);
   const chartInstanceRef = useRef(null);
   const donutContainerRef = useRef(null);
   const donutInstanceRef = useRef(null);
+  const donutBoundElRef = useRef(null); // 도넛이 그려진 DOM 요소 (화면 전환으로 바뀌면 새로 생성)
   const rowArrivedRef = useRef(new Map()); // 로그 행 key -> 처음 화면에 나타난 시각 (하이라이트용)
   const logsSeededRef = useRef(false);     // 최초 로드분은 하이라이트하지 않음
   const timelineSeededRef = useRef(false);
@@ -123,6 +156,19 @@ function App() {
   };
 
   useEffect(() => {
+    const onHash = () => setPage(pageFromHash());
+    window.addEventListener('hashchange', onHash);
+    return () => window.removeEventListener('hashchange', onHash);
+  }, []);
+  const go = (id) => { window.location.hash = `/${id}`; };
+
+  useEffect(() => {
+    const onKey = (e) => { if (e.key === 'Escape') setSelected(null); };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, []);
+
+  useEffect(() => {
     const timer = setInterval(() => setCurrentTime(new Date().toLocaleTimeString()), 1000);
     return () => clearInterval(timer);
   }, []);
@@ -148,16 +194,18 @@ function App() {
 
   const fetchData = async () => {
     try {
-      const [logRes, statRes, statusRes, serverLogRes] = await Promise.all([
+      const [logRes, statRes, statusRes, serverLogRes, typeRes] = await Promise.all([
         axios.get('http://localhost:8000/logs'),
         axios.get('http://localhost:8000/stats'),
         axios.get('http://localhost:8000/ips_status'),
         axios.get('http://localhost:8000/server_logs'),
+        axios.get('http://localhost:8000/stats/by_type'),
       ]);
       setLogs(logRes.data);
       setStats(statRes.data);
       setIpsRunning(statusRes.data.running);
       setServerLogs(serverLogRes.data.reverse());
+      setTypeCounts(typeRes.data);
       setConnected(true);
 
       // 최초 로드 시 최근 5분 내 로그로 타임라인 초기값 구성 (이후엔 웹소켓으로만 갱신)
@@ -190,6 +238,8 @@ function App() {
     setTimeline([]);
     timelineSeededRef.current = true; // 시작 직후엔 과거 로그로 재시딩하지 않음
     setBlockedIps([]);
+    setTypeCounts({});
+    setUnacked(0);
   };
 
   const handleStop = async () => {
@@ -276,7 +326,7 @@ function App() {
     } catch (e) {
       console.error('차트 생성 실패:', e);
     }
-  }, [timeline]);
+  }, [timeline, page]);
 
   // 공격 유형 비율 도넛 (추이 차트와 같은 최근 5분 데이터 기준)
   useEffect(() => {
@@ -288,9 +338,19 @@ function App() {
     }
     const types = Object.keys(totals);
     const sum = types.reduce((s, t) => s + totals[t], 0);
+    const columns = types.map(t => [t, totals[t]]);
+    const colors = Object.fromEntries(types.map(t => [t, ATTACK_COLORS[t] || '#64748b']));
 
-    if (donutInstanceRef.current) {
-      try { donutInstanceRef.current.destroy(); } catch (e) { /* 무시 */ }
+    // 같은 자리에 이미 그려진 차트는 데이터만 교체: 매번 destroy/generate 하면
+    // 그리기 애니메이션 도중 파괴되어 'innerRadius of null' 런타임 오류가 남
+    const inst = donutInstanceRef.current;
+    if (inst && donutBoundElRef.current === donutContainerRef.current) {
+      inst.data.colors(colors);
+      inst.load({ columns, unload: true });
+      return;
+    }
+    if (inst) {
+      try { inst.destroy(); } catch (e) { /* 무시 */ }
       donutInstanceRef.current = null;
     }
     if (sum === 0) return;
@@ -298,21 +358,18 @@ function App() {
     try {
       donutInstanceRef.current = bb.generate({
         bindto: donutContainerRef.current,
-        size: { height: 200 },
-        data: {
-          columns: types.map(t => [t, totals[t]]),
-          type: donut(),
-          colors: Object.fromEntries(types.map(t => [t, ATTACK_COLORS[t] || '#64748b'])),
-        },
-        donut: { title: `${sum}건`, width: 28, label: { show: false } },
+        size: { height: page === 'overview' ? 320 : 200 },
+        data: { columns, type: donut(), colors },
+        donut: { width: 28, label: { show: false } },
         legend: { show: true, position: 'right' },
         tooltip: { format: { value: (v, ratio) => `${v}건 (${(ratio * 100).toFixed(0)}%)` } },
         transition: { duration: 0 },
       });
+      donutBoundElRef.current = donutContainerRef.current;
     } catch (e) {
       console.error('도넛 차트 생성 실패:', e);
     }
-  }, [timeline]);
+  }, [timeline, page]);
 
   useEffect(() => {
     return () => {
@@ -369,7 +426,7 @@ function App() {
         }
         if (newLog.is_attack === true || newLog.is_attack === 1) {
           addTimelineEvent(newLog.attack_type, parseTimestamp(newLog.timestamp));
-          if (newLog.confidence >= LEVEL_CRITICAL) setFlashKey(k => k + 1);
+          if (newLog.confidence >= LEVEL_CRITICAL) setUnacked(n => n + 1);
           if (newLog.attack_type === 'Honeypot') {
             fetchWatchlist();
           }
@@ -422,6 +479,7 @@ function App() {
   }
 
   const hasAttacks = timeline.some(b => Object.keys(b.counts).length > 0);
+  const recentAttackTotal = timeline.reduce((s, b) => s + Object.values(b.counts).reduce((a, n) => a + n, 0), 0);
   const attackRatio = stats.total > 0 ? ((stats.attack / stats.total) * 100).toFixed(1) : null;
   const pendingReview = blockedIps.filter(b => !b.reviewed && !b.permanent).length;
 
@@ -435,86 +493,24 @@ function App() {
     </div>
   );
 
-  return (
-    <div style={styles.container}>
-      {flashKey > 0 && <div key={flashKey} className="critical-flash" />}
-
-      <header style={styles.header}>
-        <h1 style={{ display: 'flex', alignItems: 'center', gap: '12px', margin: 0, fontSize: '26px', flexWrap: 'wrap' }}>
-          <ShieldAlert size={32} color="#3b82f6" /> AI 기반 차세대 실시간 IPS
-          {ipsRunning ? (
-            <span style={styles.pill('#14532d', '#86efac')}><span className="pulse-dot" /> 실시간 보호 중</span>
-          ) : (
-            <span style={styles.pill('#334155', '#94a3b8')}>■ 중지됨</span>
-          )}
-          <span style={connected ? styles.pill('#1e3a5f', '#93c5fd') : styles.pill('#7f1d1d', '#fca5a5')}>
-            {connected ? '● 백엔드 연결됨' : '● 연결 끊김'}
-          </span>
-        </h1>
-        <div style={{ display: 'flex', alignItems: 'center', gap: '10px', flexWrap: 'wrap' }}>
-          {ipsRunning ? (
-            <button onClick={handleStop} style={styles.headerBtn('#ef4444')}>■ 중지</button>
-          ) : (
-            <button onClick={handleStart} style={styles.headerBtn('#22c55e')}>▶ 시작</button>
-          )}
-          <button onClick={handleEmergencyReset} style={styles.headerBtn('#f59e0b')}>🚨 긴급 해제</button>
-          <button onClick={enableNotifications} style={{ ...styles.headerBtn('#334155', '#94a3b8'), fontWeight: 'normal', fontSize: '13px' }}>🔔 알림 허용</button>
-          <div style={{ display: 'flex', alignItems: 'center', gap: '8px', color: '#94a3b8', fontVariantNumeric: 'tabular-nums' }}>
-            <Clock size={18} /> {currentTime}
+  const importanceBars = (features, color) => {
+    const max = features[0][1];
+    return (
+      <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
+        {features.map(([label, v]) => (
+          <div key={label} style={{ display: 'grid', gridTemplateColumns: '170px 1fr 52px', alignItems: 'center', gap: '10px', fontSize: '13px' }}>
+            <span style={{ color: '#cbd5e1' }}>{label}</span>
+            <div style={{ height: '8px', background: '#334155', borderRadius: '4px', overflow: 'hidden' }}>
+              <div style={{ width: `${(v / max) * 100}%`, height: '100%', background: color }} />
+            </div>
+            <span style={{ color: '#94a3b8', textAlign: 'right', fontVariantNumeric: 'tabular-nums' }}>{(v * 100).toFixed(1)}%</span>
           </div>
-        </div>
-      </header>
-
-      {/* KPI */}
-      <div className="kpi-row">
-        <div style={styles.card}>
-          <div style={styles.cardTitle}><Activity size={18} /> 전체 탐지</div>
-          <div style={styles.kpiValue('#f1f5f9')}>{stats.total.toLocaleString()} <span style={{ fontSize: '16px' }}>건</span></div>
-          <div style={styles.kpiSub}>정상 {stats.benign.toLocaleString()}건</div>
-        </div>
-        <div style={styles.card}>
-          <div style={styles.cardTitle}><ShieldAlert size={18} /> 공격 탐지</div>
-          <div style={styles.kpiValue('#ef4444')}>{stats.attack.toLocaleString()} <span style={{ fontSize: '16px' }}>건</span></div>
-          <div style={styles.kpiSub}>{attackRatio !== null ? `전체 트래픽의 ${attackRatio}%` : '—'}</div>
-        </div>
-        <div style={styles.card}>
-          <div style={styles.cardTitle}><Ban size={18} /> 차단 IP</div>
-          <div style={styles.kpiValue('#f43f5e')}>{blockedIps.length} <span style={{ fontSize: '16px' }}>IP</span></div>
-          <div style={styles.kpiSub}>{pendingReview > 0 ? `관리자 검토 대기 ${pendingReview}건` : '검토 대기 없음'}</div>
-        </div>
-        <div style={styles.card}>
-          <div style={styles.cardTitle}><Eye size={18} /> 감시목록</div>
-          <div style={styles.kpiValue('#06b6d4')}>{watchlist.length} <span style={{ fontSize: '16px' }}>IP</span></div>
-          <div style={styles.kpiSub}>허니팟·반복 공격 자동 등록</div>
-        </div>
+        ))}
       </div>
+    );
+  };
 
-      {/* 차트 */}
-      <div className="dash-row">
-        <div style={styles.card}>
-          <div style={{ ...styles.cardTitle, marginBottom: '12px' }}><BarChart3 size={18} /> 공격 유형별 탐지 추이 (최근 5분)</div>
-          <div style={{ position: 'relative', width: '100%' }}>
-            {!hasAttacks && emptyChart(BarChart3, '탐지된 공격 없음')}
-            <div ref={chartContainerRef} style={{ width: '100%', height: '200px', visibility: hasAttacks ? 'visible' : 'hidden' }} />
-          </div>
-        </div>
-        <div style={styles.card}>
-          <div style={{ ...styles.cardTitle, marginBottom: '12px' }}><PieChart size={18} /> 공격 유형 비율 (최근 5분)</div>
-          <div style={{ position: 'relative', width: '100%' }}>
-            {!hasAttacks && emptyChart(PieChart, '데이터 없음')}
-            <div ref={donutContainerRef} style={{ width: '100%', height: '200px', visibility: hasAttacks ? 'visible' : 'hidden' }} />
-          </div>
-        </div>
-      </div>
-
-      {/* 위협 피드 + 차단/감시 */}
-      <div className="dash-row">
-        <section style={styles.panel}>
-          <div style={styles.panelHeader}>
-            <span>📍 실시간 위협 피드</span>
-            <span style={styles.panelHint}>최근 50건 · ML 모델 판정</span>
-          </div>
-          <div className="scroll-y" style={{ maxHeight: '460px' }}>
+  const feedTable = (rows) => (
             <table style={styles.table}>
               <thead>
                 <tr>
@@ -526,7 +522,7 @@ function App() {
                 </tr>
               </thead>
               <tbody>
-                {feedRows.length === 0 ? (
+                {rows.length === 0 ? (
                   <tr>
                     <td colSpan={5} style={{ ...styles.td, textAlign: 'center', padding: '48px', color: '#475569' }}>
                       <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '10px' }}>
@@ -536,11 +532,11 @@ function App() {
                       </div>
                     </td>
                   </tr>
-                ) : feedRows.map(({ log, key, isNew }) => {
+                ) : rows.map(({ log, key, isNew }) => {
                   const level = LEVELS[threatLevel(log)];
                   const pct = Math.round((log.confidence || 0) * 100);
                   return (
-                    <tr key={key} className={isNew ? 'row-new' : undefined}>
+                    <tr key={key} className={isNew ? 'row-new clickable' : 'clickable'} onClick={() => setSelected(log)} title="클릭하면 상세 정보">
                       <td style={{ ...styles.td, color: '#94a3b8', fontVariantNumeric: 'tabular-nums', whiteSpace: 'nowrap' }}>{log.timestamp}</td>
                       <td style={styles.td}>
                         <span style={{ display: 'inline-flex', alignItems: 'center', gap: '8px', fontWeight: 'bold', color: log.is_attack ? '#f1f5f9' : log.attack_type === 'Suspicious' ? level.color : '#22c55e' }}>
@@ -565,10 +561,242 @@ function App() {
                 })}
               </tbody>
             </table>
-          </div>
-        </section>
+  );
 
-        <div style={{ display: 'flex', flexDirection: 'column', gap: '20px', minWidth: 0 }}>
+  const donutCard = (
+        <div style={styles.card}>
+          <div style={{ ...styles.cardTitle, marginBottom: '12px' }}><PieChart size={18} /> 공격 유형 비율 (최근 5분){hasAttacks && <span style={{ marginLeft: 'auto', color: '#f1f5f9' }}>{recentAttackTotal}건</span>}</div>
+          <div style={{ position: 'relative', width: '100%' }}>
+            {!hasAttacks && emptyChart(PieChart, '데이터 없음')}
+            <div ref={donutContainerRef} style={{ width: '100%', height: page === 'overview' ? '320px' : '200px', visibility: hasAttacks ? 'visible' : 'hidden' }} />
+          </div>
+        </div>
+  );
+
+  const adviceTypes = Object.entries(typeCounts).filter(([, n]) => n > 0).sort((a, b) => b[1] - a[1]);
+  const counts = { events: stats.attack, advice: adviceTypes.length, blocked: blockedIps.length, watchlist: watchlist.length, server: serverLogs.length };
+  const pageInfo = PAGES.find(pg => pg.id === page);
+
+  return (
+    <div style={styles.container}>
+      {unacked > 0 && <div className="critical-alarm" />}
+
+      <header style={styles.header}>
+        <h1 style={{ display: 'flex', alignItems: 'center', gap: '12px', margin: 0, fontSize: '26px', flexWrap: 'wrap' }}>
+          <ShieldAlert size={32} color="#3b82f6" /> ML 기반 실시간 침입 방지 시스템
+          {ipsRunning ? (
+            <span style={styles.pill('#14532d', '#86efac')}><span className="pulse-dot" /> 실시간 보호 중</span>
+          ) : (
+            <span style={styles.pill('#334155', '#94a3b8')}>■ 중지됨</span>
+          )}
+          <span style={connected ? styles.pill('#1e3a5f', '#93c5fd') : styles.pill('#7f1d1d', '#fca5a5')}>
+            {connected ? '● 백엔드 연결됨' : '● 연결 끊김'}
+          </span>
+        </h1>
+        <div style={{ display: 'flex', alignItems: 'center', gap: '10px', flexWrap: 'wrap' }}>
+          {ipsRunning ? (
+            <button onClick={handleStop} style={styles.headerBtn('#ef4444')}>■ 중지</button>
+          ) : (
+            <button onClick={handleStart} style={styles.headerBtn('#22c55e')}>▶ 시작</button>
+          )}
+          {unacked > 0 && (
+            <button onClick={() => setUnacked(0)} className="alarm-ack" style={styles.headerBtn('#be123c')}>⚠ 미확인 경고 {unacked}건 · 확인</button>
+          )}
+          <button onClick={handleEmergencyReset} style={styles.headerBtn('#f59e0b')}>🚨 긴급 해제</button>
+          <button onClick={enableNotifications} style={{ ...styles.headerBtn('#334155', '#94a3b8'), fontWeight: 'normal', fontSize: '13px' }}>🔔 알림 허용</button>
+          <div style={{ display: 'flex', alignItems: 'center', gap: '8px', color: '#94a3b8', fontVariantNumeric: 'tabular-nums' }}>
+            <Clock size={18} /> {currentTime}
+          </div>
+        </div>
+      </header>
+
+      <div className="app-shell">
+        {/* 사이드바 메뉴 */}
+        <nav className="sidebar">
+          {PAGES.map(({ id, label, icon: Icon }) => (
+            <a key={id} href={`#/${id}`} className={page === id ? 'nav-item active' : 'nav-item'}>
+              <Icon size={18} />
+              <span style={{ flex: 1 }}>{label}</span>
+              {counts[id] > 0 && <span className="nav-count">{counts[id]}</span>}
+            </a>
+          ))}
+        </nav>
+
+        <main style={{ minWidth: 0 }}>
+          <h2 style={{ fontSize: '22px', margin: '0 0 16px', color: '#f1f5f9' }}>{pageInfo.label}</h2>
+
+          {page === 'overview' && (<>
+      {/* KPI */}
+      <div className="kpi-row">
+        <div style={styles.card}>
+          <div style={styles.cardTitle}><Activity size={18} /> 전체 탐지</div>
+          <div style={styles.kpiValue('#f1f5f9')}>{stats.total.toLocaleString()} <span style={{ fontSize: '16px' }}>건</span></div>
+          <div style={styles.kpiSub}>정상 {stats.benign.toLocaleString()}건</div>
+        </div>
+        <div style={styles.card}>
+          <div style={styles.cardTitle}><ShieldAlert size={18} /> 공격 탐지</div>
+          <div style={styles.kpiValue('#ef4444')}>{stats.attack.toLocaleString()} <span style={{ fontSize: '16px' }}>건</span></div>
+          <div style={styles.kpiSub}>{attackRatio !== null ? `전체 트래픽의 ${attackRatio}%` : '—'}</div>
+        </div>
+        <div style={styles.card}>
+          <div style={styles.cardTitle}><Ban size={18} /> 차단 IP</div>
+          <div style={styles.kpiValue('#f43f5e')}>{blockedIps.length} <span style={{ fontSize: '16px' }}>IP</span></div>
+          <div style={styles.kpiSub}>{pendingReview > 0 ? `관리자 검토 대기 ${pendingReview}건` : '검토 대기 없음'}</div>
+        </div>
+        <div style={styles.card}>
+          <div style={styles.cardTitle}><Eye size={18} /> 감시목록</div>
+          <div style={styles.kpiValue('#06b6d4')}>{watchlist.length} <span style={{ fontSize: '16px' }}>IP</span></div>
+          <div style={styles.kpiSub}>허니팟·반복 공격 자동 등록</div>
+        </div>
+      </div>
+          <div className="dash-row">
+            <section style={styles.panel}>
+              <div style={styles.panelHeader}>
+                <span>📍 최근 탐지 10건</span>
+                <button onClick={() => go('events')} style={{ background: 'none', border: 'none', color: '#93c5fd', cursor: 'pointer', fontSize: '13px' }}>탐지 로그 전체 보기 →</button>
+              </div>
+              {feedTable(feedRows.slice(0, 10))}
+            </section>
+            {donutCard}
+          </div>
+          </>)}
+
+          {page === 'events' && (<>
+          <div className="dash-row">
+        <div style={styles.card}>
+          <div style={{ ...styles.cardTitle, marginBottom: '12px' }}><BarChart3 size={18} /> 공격 유형별 탐지 추이 (최근 5분)</div>
+          <div style={{ position: 'relative', width: '100%' }}>
+            {!hasAttacks && emptyChart(BarChart3, '탐지된 공격 없음')}
+            <div ref={chartContainerRef} style={{ width: '100%', height: '200px', visibility: hasAttacks ? 'visible' : 'hidden' }} />
+          </div>
+        </div>
+            {donutCard}
+          </div>
+          <section style={styles.panel}>
+            <div style={styles.panelHeader}>
+              <span>📍 실시간 위협 피드</span>
+              <span style={styles.panelHint}>최근 50건 · ML 모델 판정</span>
+            </div>
+            <div className="scroll-y" style={{ maxHeight: 'calc(100vh - 560px)', minHeight: '300px' }}>
+              {feedTable(feedRows)}
+            </div>
+          </section>
+          </>)}
+
+          {page === 'advice' && (adviceTypes.length === 0 ? (
+            <section style={styles.panel}><div style={styles.empty}>탐지된 공격이 없어 권고사항이 없습니다</div></section>
+          ) : (<>
+            <p style={{ color: '#94a3b8', margin: '0 0 16px', fontSize: '14px' }}>ML 탐지 결과를 바탕으로 공격 유형별 권고 조치를 자동으로 정리합니다 · 탐지가 많은 순</p>
+            <div className="advice-grid">
+              {adviceTypes.map(([type, n], i) => {
+                const a = ADVICE[type] || ADVICE_DEFAULT;
+                const blockedN = blockedIps.filter(b => b.attack_type === type).length;
+                return (
+                  <section key={type} style={{ ...styles.panel, padding: '20px 24px', gap: '12px', borderTop: `3px solid ${ATTACK_COLORS[type] || '#64748b'}` }}>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: '10px', flexWrap: 'wrap' }}>
+                      <span style={{ fontSize: '20px', fontWeight: 'bold' }}>{type}</span>
+                      <span style={{ color: '#f1f5f9', fontVariantNumeric: 'tabular-nums' }}>{n}건</span>
+                      <span style={styles.threatBadge(a.risk)}>{a.risk === 'high' ? '위험도 높음' : '위험도 중간'}</span>
+                      {i === 0 && <span style={styles.countBadge('#f59e0b')}>우선 대응</span>}
+                    </div>
+                    <p style={{ margin: 0, color: '#94a3b8', fontSize: '14px' }}>{a.desc}</p>
+                    <ul style={{ margin: 0, paddingLeft: '20px', display: 'flex', flexDirection: 'column', gap: '6px', fontSize: '14px', lineHeight: 1.5 }}>
+                      {a.actions.map(act => <li key={act}>{act}</li>)}
+                    </ul>
+                    <p style={{ margin: 0, fontSize: '13px', color: '#64748b' }}>자동 대응 현황: 차단 {blockedN} IP</p>
+                  </section>
+                );
+              })}
+            </div>
+          </>))}
+
+          {page === 'model' && (<>
+            <p style={{ color: '#94a3b8', margin: '0 0 16px', fontSize: '14px' }}>두 모델 모두 Random Forest입니다. 판정 확률(신뢰도)이 그대로 4단계 자동 대응의 기준이 됩니다.</p>
+            <div className="model-grid">
+              {['flow', 'http'].map(id => {
+                const m = MODELS[id];
+                return (
+                  <section key={id} style={{ ...styles.panel, padding: '20px 24px', gap: '16px' }}>
+                    <div style={{ display: 'flex', alignItems: 'baseline', gap: '10px', flexWrap: 'wrap' }}>
+                      <span style={{ fontSize: '20px', fontWeight: 'bold' }}>{m.name}</span>
+                      <span style={styles.panelHint}>{m.algo}</span>
+                    </div>
+                    <div style={{ fontSize: '14px', color: '#94a3b8', lineHeight: 1.7 }}>입력: {m.input}<br />학습 데이터: {m.data}</div>
+                    <div style={{ display: 'flex', gap: '6px', flexWrap: 'wrap' }}>
+                      {m.classes.map(c => <span key={c} style={{ padding: '3px 10px', borderRadius: '12px', fontSize: '12px', background: '#334155', color: '#e2e8f0' }}>{c}</span>)}
+                    </div>
+                    <div className="metric-row" style={{ gridTemplateColumns: 'repeat(2, minmax(0, 1fr))' }}>
+                      {m.metrics.map(([k, v]) => (
+                        <div key={k} style={{ background: '#0f172a', borderRadius: '10px', padding: '12px 14px' }}>
+                          <div style={{ fontSize: '22px', fontWeight: 'bold', fontVariantNumeric: 'tabular-nums' }}>{v}</div>
+                          <div style={{ fontSize: '12px', color: '#94a3b8', marginTop: '2px' }}>{k}</div>
+                        </div>
+                      ))}
+                    </div>
+                    <div>
+                      <div style={{ fontSize: '14px', fontWeight: 'bold', marginBottom: '10px' }}>판정에 중요한 특징 TOP 10</div>
+                      {importanceBars(m.features, id === 'flow' ? '#a855f7' : '#3b82f6')}
+                    </div>
+                  </section>
+                );
+              })}
+            </div>
+
+            <div className="model-grid" style={{ marginTop: '20px' }}>
+              <section style={styles.panel}>
+                <div style={styles.panelHeader}><span>흐름 모델 · 학습 데이터별 정확도</span><span style={styles.panelHint}>같은 평가 데이터로 비교</span></div>
+                <table style={styles.table}>
+                  <thead><tr><th style={styles.th}>학습 데이터</th><th style={{ ...styles.th, textAlign: 'right' }}>시연 환경 평가</th><th style={{ ...styles.th, textAlign: 'right' }}>공개 데이터 평가</th></tr></thead>
+                  <tbody>
+                    {FLOW_COMPARISON.map(([name, own, pub], i) => {
+                      const chosen = i === FLOW_COMPARISON.length - 1;
+                      return (
+                        <tr key={name} style={chosen ? { background: '#1e3a5f' } : undefined}>
+                          <td style={{ ...styles.td, fontWeight: chosen ? 'bold' : 'normal' }}>{name}</td>
+                          <td style={{ ...styles.td, textAlign: 'right', fontVariantNumeric: 'tabular-nums' }}>{own}</td>
+                          <td style={{ ...styles.td, textAlign: 'right', fontVariantNumeric: 'tabular-nums' }}>{pub}</td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+                <p style={{ margin: 0, padding: '14px 20px', fontSize: '13px', color: '#94a3b8' }}>공개 데이터만으로는 실제 환경에서 24%로 떨어져, 직접 캡처 데이터를 합친 하이브리드를 채택했습니다.</p>
+              </section>
+
+              <section style={styles.panel}>
+                <div style={styles.panelHeader}><span>혼동 행렬 · 하이브리드 흐름 모델</span><span style={styles.panelHint}>직접 캡처 평가 70,776건 · 행: 실제, 열: 예측</span></div>
+                <table style={styles.table}>
+                  <thead><tr><th style={styles.th}>실제 \ 예측</th>{CONFUSION.classes.map(c => <th key={c} style={{ ...styles.th, textAlign: 'right' }}>{c}</th>)}</tr></thead>
+                  <tbody>
+                    {CONFUSION.matrix.map((row, r) => (
+                      <tr key={r}>
+                        <td style={{ ...styles.td, color: '#94a3b8' }}>{CONFUSION.classes[r]}</td>
+                        {row.map((n, c) => (
+                          <td key={c} style={{ ...styles.td, textAlign: 'right', fontVariantNumeric: 'tabular-nums', fontWeight: r === c ? 'bold' : 'normal', color: r === c ? '#86efac' : n > 0 ? '#fca5a5' : '#475569' }}>{n.toLocaleString()}</td>
+                        ))}
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+                <p style={{ margin: 0, padding: '14px 20px', fontSize: '13px', color: '#94a3b8' }}>공격 유형끼리 헷갈린 경우는 0건이고, 정상 ↔ BruteForce 혼동만 0.1~0.4% 있습니다.</p>
+              </section>
+            </div>
+
+            <section style={{ ...styles.panel, marginTop: '20px' }}>
+              <div style={styles.panelHeader}><span>신뢰도에 따른 자동 대응</span><span style={styles.panelHint}>흐름 모델 신뢰도 80% 미만은 차단 없이 '미분류 의심'으로 표시</span></div>
+              <div className="metric-row" style={{ padding: '16px 20px' }}>
+                {RESPONSE_LEVELS.map(([lv, th, act]) => (
+                  <div key={lv} style={{ background: lv === 'CRITICAL' ? '#7f1d1d' : '#0f172a', borderRadius: '10px', padding: '14px 16px' }}>
+                    <div style={{ fontSize: '12px', color: '#94a3b8' }}>{th}</div>
+                    <div style={{ fontSize: '18px', fontWeight: 'bold', margin: '4px 0' }}>{lv}</div>
+                    <div style={{ fontSize: '13px', color: '#cbd5e1' }}>{act}</div>
+                  </div>
+                ))}
+              </div>
+            </section>
+          </>)}
+
+          {page === 'blocked' && (
           <section style={styles.panel}>
             <div style={styles.panelHeader}>
               <span style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
@@ -576,7 +804,7 @@ function App() {
               </span>
               <span style={styles.panelHint}>기본 10분 후 자동 해제</span>
             </div>
-            <div className="scroll-y" style={{ maxHeight: '250px' }}>
+            <div className="scroll-y" style={{ maxHeight: 'calc(100vh - 260px)' }}>
               {blockedIps.length === 0 ? (
                 <div style={styles.empty}>현재 차단된 IP 없음</div>
               ) : blockedIps.map((item) => (
@@ -601,15 +829,17 @@ function App() {
               ))}
             </div>
           </section>
+          )}
 
-          <section style={{ ...styles.panel, flex: 1 }}>
+          {page === 'watchlist' && (
+          <section style={styles.panel}>
             <div style={styles.panelHeader}>
               <span style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
                 👁 감시목록 {watchlist.length > 0 && <span style={styles.countBadge('#06b6d4')}>{watchlist.length}</span>}
               </span>
               <span style={styles.panelHint}>신뢰도 +20% 가중 적용</span>
             </div>
-            <div className="scroll-y" style={{ maxHeight: '200px' }}>
+            <div className="scroll-y" style={{ maxHeight: 'calc(100vh - 260px)' }}>
               {watchlist.length === 0 ? (
                 <div style={styles.empty}>감시 중인 IP 없음</div>
               ) : watchlist.map((item) => (
@@ -634,9 +864,9 @@ function App() {
               ))}
             </div>
           </section>
-        </div>
-      </div>
+          )}
 
+          {page === 'server' && (<>
       {/* 서버 접속 로그 */}
       <section style={styles.panel}>
         <div
@@ -650,7 +880,7 @@ function App() {
           {serverLogsOpen ? <ChevronUp size={18} color="#94a3b8" /> : <ChevronDown size={18} color="#94a3b8" />}
         </div>
         {serverLogsOpen && (
-          <div className="scroll-y" style={{ maxHeight: '300px' }}>
+          <div className="scroll-y" style={{ maxHeight: 'calc(100vh - 300px)' }}>
             <table style={styles.table}>
               <thead>
                 <tr>
@@ -688,6 +918,65 @@ function App() {
           </div>
         )}
       </section>
+          </>)}
+        </main>
+      </div>
+      {selected && (() => {
+        const log = selected;
+        const level = LEVELS[threatLevel(log)];
+        const pct = Math.round((log.confidence || 0) * 100);
+        const suspicious = log.attack_type === 'Suspicious';
+        const m = MODELS[modelOf(log.attack_type)];
+        const advice = log.is_attack ? (ADVICE[log.attack_type] || ADVICE_DEFAULT) : null;
+        const label = suspicious ? '미분류 의심' : log.attack_type;
+        return (
+          <div className="modal-backdrop" onClick={() => setSelected(null)}>
+            <div className="modal" onClick={e => e.stopPropagation()} role="dialog" aria-label={`${label} 상세 정보`}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: '10px', marginBottom: '16px' }}>
+                <span style={{ width: '12px', height: '12px', borderRadius: '50%', background: log.is_attack ? (ATTACK_COLORS[log.attack_type] || '#64748b') : suspicious ? level.color : '#22c55e' }} />
+                <span style={{ fontSize: '22px', fontWeight: 'bold' }}>{label}</span>
+                <span style={{ ...styles.pill('#0f172a', level.color), fontWeight: 'bold' }}>{level.label}</span>
+                <button onClick={() => setSelected(null)} aria-label="닫기" style={{ marginLeft: 'auto', background: 'none', border: 'none', color: '#94a3b8', cursor: 'pointer' }}><X size={22} /></button>
+              </div>
+
+              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '10px', marginBottom: '20px', fontSize: '14px' }}>
+                {[['탐지 시간', log.timestamp], ['공격자 IP', log.attacker_ip], ['방어 상태', log.blocked ? '차단 완료' : log.is_attack ? '탐지됨 (단계별 대응 중)' : '조치 없음'], ['판정 모델', `${m.name} · ${m.algo}`]].map(([k, v]) => (
+                  <div key={k} style={{ background: '#0f172a', borderRadius: '10px', padding: '10px 14px' }}>
+                    <div style={{ fontSize: '12px', color: '#94a3b8' }}>{k}</div>
+                    <div style={{ marginTop: '2px', fontFamily: k === '공격자 IP' ? 'monospace' : 'inherit' }}>{v}</div>
+                  </div>
+                ))}
+              </div>
+
+              <div style={{ fontSize: '15px', fontWeight: 'bold', marginBottom: '8px' }}>🧠 ML 판단</div>
+              <div style={{ display: 'flex', alignItems: 'center', gap: '10px', marginBottom: '6px' }}>
+                <div style={{ flex: 1, height: '10px', borderRadius: '5px', background: '#334155', overflow: 'hidden' }}>
+                  <div style={{ width: `${pct}%`, height: '100%', background: level.color }} />
+                </div>
+                <span style={{ color: level.color, fontWeight: 'bold', fontVariantNumeric: 'tabular-nums' }}>신뢰도 {pct}%</span>
+              </div>
+              <p style={{ margin: '0 0 12px', fontSize: '13px', color: '#94a3b8' }}>
+                {suspicious ? '모델 신뢰도가 80% 미만이라 차단하지 않고 미분류로 표시했습니다. 학습하지 않은 유형의 공격일 수 있습니다.'
+                  : `${m.name}이 ${m.input}을 보고 판정했습니다. 이 모델이 판정에 가장 많이 쓰는 특징:`}
+              </p>
+              {!suspicious && importanceBars(m.features.slice(0, 5), modelOf(log.attack_type) === 'flow' ? '#a855f7' : '#3b82f6')}
+
+              {advice && (<>
+                <div style={{ fontSize: '15px', fontWeight: 'bold', margin: '20px 0 8px' }}>🛡 대응 방법</div>
+                <p style={{ margin: '0 0 8px', fontSize: '13px', color: '#94a3b8' }}>{advice.desc}</p>
+                <ol style={{ margin: 0, paddingLeft: '20px', display: 'flex', flexDirection: 'column', gap: '6px', fontSize: '14px', lineHeight: 1.5 }}>
+                  {advice.actions.map(a => <li key={a}>{a}</li>)}
+                </ol>
+                <a href={`https://www.google.com/search?q=${encodeURIComponent(`${log.attack_type} 공격 대응 방법`)}`} target="_blank" rel="noopener noreferrer"
+                  style={{ display: 'inline-block', marginTop: '16px', padding: '8px 16px', borderRadius: '8px', background: '#3b82f6', color: '#fff', textDecoration: 'none', fontSize: '14px', fontWeight: 'bold' }}>
+                  🔎 {log.attack_type} 대응 방법 더 찾아보기
+                </a>
+              </>)}
+              {!log.is_attack && !suspicious && <p style={{ marginTop: '20px', fontSize: '14px', color: '#86efac' }}>정상 트래픽으로 판정되어 조치가 필요 없습니다.</p>}
+            </div>
+          </div>
+        );
+      })()}
     </div>
   );
 }

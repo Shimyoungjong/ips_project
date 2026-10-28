@@ -47,14 +47,25 @@
   animation: pulse 1.6s infinite;
 }
 
-/* Critical 탐지 시 화면 테두리 경고 */
-@keyframes critical-flash {
-  0%, 40% { box-shadow: inset 0 0 0 4px rgba(244, 63, 94, 0.9), inset 0 0 60px rgba(244, 63, 94, 0.35); }
-  100%    { box-shadow: inset 0 0 0 4px rgba(244, 63, 94, 0), inset 0 0 60px rgba(244, 63, 94, 0); }
+/* Critical 경고: 관리자가 '확인'을 누를 때까지 테두리가 2초 주기로 반복 깜박임 */
+@keyframes critical-alarm {
+  0%, 100% { box-shadow: inset 0 0 0 4px rgba(244, 63, 94, 0.15), inset 0 0 60px rgba(244, 63, 94, 0); }
+  50%      { box-shadow: inset 0 0 0 4px rgba(244, 63, 94, 0.9), inset 0 0 60px rgba(244, 63, 94, 0.35); }
 }
-.critical-flash {
+.critical-alarm {
   position: fixed; inset: 0; pointer-events: none; z-index: 50;
-  animation: critical-flash 1.8s ease-out forwards;
+  animation: critical-alarm 2s ease-in-out infinite;
+}
+.alarm-ack { animation: pulse-red 2s infinite; }
+@keyframes pulse-red {
+  0%   { box-shadow: 0 0 0 0 rgba(244, 63, 94, 0.7); }
+  70%  { box-shadow: 0 0 0 10px rgba(244, 63, 94, 0); }
+  100% { box-shadow: 0 0 0 0 rgba(244, 63, 94, 0); }
+}
+/* 움직임 줄이기 설정 사용자는 깜박임 없이 빨간 테두리만 고정 표시 */
+@media (prefers-reduced-motion: reduce) {
+  .critical-alarm { animation: none; box-shadow: inset 0 0 0 4px rgba(244, 63, 94, 0.9); }
+  .alarm-ack { animation: none; }
 }
 
 /* billboard.js 다크 테마 보정 */
@@ -64,3 +75,50 @@
 .bb-chart-arc path { stroke: #1e293b; }
 .bb-chart-arcs-title { fill: #f1f5f9 !important; font-size: 22px; font-weight: bold; }
 .bb-tooltip-container .bb-tooltip { color: #0f172a; }
+
+/* 사이드바 메뉴 + 페이지 */
+.app-shell {
+  display: grid;
+  grid-template-columns: 200px minmax(0, 1fr);
+  gap: 24px;
+  align-items: start;
+}
+.sidebar {
+  position: sticky; top: 24px;
+  display: flex; flex-direction: column; gap: 4px;
+  background: #1e293b; border: 1px solid #334155; border-radius: 16px; padding: 12px;
+}
+.nav-item {
+  display: flex; align-items: center; gap: 10px;
+  padding: 10px 12px; border-radius: 10px;
+  color: #94a3b8; text-decoration: none; font-size: 15px; font-weight: 600;
+}
+.nav-item:hover { background: #273449; color: #e2e8f0; }
+.nav-item.active { background: #1e3a5f; color: #93c5fd; }
+.nav-count { background: #334155; color: #e2e8f0; border-radius: 10px; padding: 1px 8px; font-size: 12px; }
+.advice-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(360px, 1fr)); gap: 20px; }
+
+@media (max-width: 1100px) {
+  .app-shell { grid-template-columns: minmax(0, 1fr); }
+  .sidebar { position: static; flex-direction: row; flex-wrap: wrap; }
+}
+.advice-grid { word-break: keep-all; } /* 한글이 글자 중간에서 줄바꿈되지 않게 */
+
+/* 모델 정보 페이지 */
+.model-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 20px; }
+.metric-row { display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); gap: 10px; }
+@media (max-width: 1100px) { .model-grid { grid-template-columns: minmax(0, 1fr); } }
+
+/* 탐지 항목 클릭 → 상세 모달 */
+tr.clickable { cursor: pointer; }
+tr.clickable:hover td { background: #273449; }
+.modal-backdrop {
+  position: fixed; inset: 0; z-index: 100;
+  background: rgba(2, 6, 23, 0.7);
+  display: flex; align-items: center; justify-content: center;
+}
+.modal {
+  width: min(720px, 92vw); max-height: 88vh; overflow-y: auto;
+  background: #1e293b; border: 1px solid #334155; border-radius: 16px;
+  padding: 24px; color: #f1f5f9; word-break: keep-all;
+}
