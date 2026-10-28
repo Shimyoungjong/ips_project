@@ -77,6 +77,10 @@ const pageFromHash = () => {
   return PAGES.some(pg => pg.id === id) ? id : 'overview';
 };
 
+// 화면 표시용 유형 이름 (모델 클래스명은 그대로). 공격자 한 대면 엄밀히 DoS라 'DoS/DDoS'로 표시
+const TYPE_LABELS = { DDoS: 'DoS/DDoS', Suspicious: '미분류 의심' };
+const typeLabel = (t) => TYPE_LABELS[t] || t;
+
 const ROW_HIGHLIGHT_MS = 2000; // 새 탐지 행 하이라이트 유지 시간
 
 const styles = {
@@ -300,6 +304,7 @@ function App() {
           x: 'x',
           columns: [xColumn, ...typeColumns],
           type: spline(),
+          names: TYPE_LABELS,
           colors,
         },
         point: { r: 2 },
@@ -359,7 +364,7 @@ function App() {
       donutInstanceRef.current = bb.generate({
         bindto: donutContainerRef.current,
         size: { height: page === 'overview' ? 320 : 200 },
-        data: { columns, type: donut(), colors },
+        data: { columns, type: donut(), colors, names: TYPE_LABELS },
         donut: { width: 28, label: { show: false } },
         legend: { show: true, position: 'right' },
         tooltip: { format: { value: (v, ratio) => `${v}건 (${(ratio * 100).toFixed(0)}%)` } },
@@ -432,13 +437,13 @@ function App() {
           }
           if (newLog.blocked && Notification.permission === 'granted') {
             new Notification('🚫 IP 차단됨 — 관리자 검토 필요', {
-              body: `${newLog.attack_type} | IP: ${newLog.attacker_ip} | 블랙리스트 등록됨, 검토 후 조치하세요.`,
+              body: `${typeLabel(newLog.attack_type)} | IP: ${newLog.attacker_ip} | 블랙리스트 등록됨, 검토 후 조치하세요.`,
               icon: '/favicon.ico'
             });
             fetchBlockedIps();
           } else if (newLog.confidence >= LEVEL_CRITICAL && Notification.permission === 'granted') {
             new Notification('🔴 Critical 공격 탐지!', {
-              body: `${newLog.attack_type} | IP: ${newLog.attacker_ip}`,
+              body: `${typeLabel(newLog.attack_type)} | IP: ${newLog.attacker_ip}`,
               icon: '/favicon.ico'
             });
           }
@@ -541,7 +546,7 @@ function App() {
                       <td style={styles.td}>
                         <span style={{ display: 'inline-flex', alignItems: 'center', gap: '8px', fontWeight: 'bold', color: log.is_attack ? '#f1f5f9' : log.attack_type === 'Suspicious' ? level.color : '#22c55e' }}>
                           <span style={{ width: '8px', height: '8px', borderRadius: '50%', backgroundColor: log.is_attack ? (ATTACK_COLORS[log.attack_type] || '#64748b') : log.attack_type === 'Suspicious' ? level.color : '#22c55e' }} />
-                          {log.attack_type === 'Suspicious' ? '미분류 의심' : log.attack_type}
+                          {typeLabel(log.attack_type)}
                         </span>
                       </td>
                       <td style={{ ...styles.td, fontFamily: 'monospace' }}>{log.attacker_ip}</td>
@@ -694,7 +699,7 @@ function App() {
                 return (
                   <section key={type} style={{ ...styles.panel, padding: '20px 24px', gap: '12px', borderTop: `3px solid ${ATTACK_COLORS[type] || '#64748b'}` }}>
                     <div style={{ display: 'flex', alignItems: 'center', gap: '10px', flexWrap: 'wrap' }}>
-                      <span style={{ fontSize: '20px', fontWeight: 'bold' }}>{type}</span>
+                      <span style={{ fontSize: '20px', fontWeight: 'bold' }}>{typeLabel(type)}</span>
                       <span style={{ color: '#f1f5f9', fontVariantNumeric: 'tabular-nums' }}>{n}건</span>
                       <span style={styles.threatBadge(a.risk)}>{a.risk === 'high' ? '위험도 높음' : '위험도 중간'}</span>
                       {i === 0 && <span style={styles.countBadge('#f59e0b')}>우선 대응</span>}
@@ -818,7 +823,7 @@ function App() {
                         : <span style={styles.threatBadge('high')}>검토 대기</span>}
                   </div>
                   <div style={{ fontSize: '12px', color: '#94a3b8', margin: '6px 0 8px' }}>
-                    {item.attack_type} · {item.blocked_at}{!item.permanent && ` → ${item.auto_unblock_at} 해제`}
+                    {typeLabel(item.attack_type)} · {item.blocked_at}{!item.permanent && ` → ${item.auto_unblock_at} 해제`}
                   </div>
                   <div style={{ display: 'flex', gap: '6px', flexWrap: 'wrap' }}>
                     <button onClick={() => handleBlockedDecision(item.ip, 'keep_10min')} style={styles.smallBtn('#fcd34d')}>10분 유지</button>
@@ -928,7 +933,7 @@ function App() {
         const suspicious = log.attack_type === 'Suspicious';
         const m = MODELS[modelOf(log.attack_type)];
         const advice = log.is_attack ? (ADVICE[log.attack_type] || ADVICE_DEFAULT) : null;
-        const label = suspicious ? '미분류 의심' : log.attack_type;
+        const label = typeLabel(log.attack_type);
         return (
           <div className="modal-backdrop" onClick={() => setSelected(null)}>
             <div className="modal" onClick={e => e.stopPropagation()} role="dialog" aria-label={`${label} 상세 정보`}>
@@ -967,9 +972,9 @@ function App() {
                 <ol style={{ margin: 0, paddingLeft: '20px', display: 'flex', flexDirection: 'column', gap: '6px', fontSize: '14px', lineHeight: 1.5 }}>
                   {advice.actions.map(a => <li key={a}>{a}</li>)}
                 </ol>
-                <a href={`https://www.google.com/search?q=${encodeURIComponent(`${log.attack_type} 공격 대응 방법`)}`} target="_blank" rel="noopener noreferrer"
+                <a href={`https://www.google.com/search?q=${encodeURIComponent(`${typeLabel(log.attack_type)} 공격 대응 방법`)}`} target="_blank" rel="noopener noreferrer"
                   style={{ display: 'inline-block', marginTop: '16px', padding: '8px 16px', borderRadius: '8px', background: '#3b82f6', color: '#fff', textDecoration: 'none', fontSize: '14px', fontWeight: 'bold' }}>
-                  🔎 {log.attack_type} 대응 방법 더 찾아보기
+                  🔎 {typeLabel(log.attack_type)} 대응 방법 더 찾아보기
                 </a>
               </>)}
               {!log.is_attack && !suspicious && <p style={{ marginTop: '20px', fontSize: '14px', color: '#86efac' }}>정상 트래픽으로 판정되어 조치가 필요 없습니다.</p>}

@@ -8,7 +8,7 @@ export const MODELS = {
     name: '흐름 모델',
     algo: 'Random Forest · 트리 200개',
     input: '패킷 흐름 통계 59개',
-    classes: ['BENIGN', 'BruteForce', 'DDoS', 'PortScan'],
+    classes: ['BENIGN', 'BruteForce', 'DoS/DDoS', 'PortScan'],
     data: 'CIC-IDS2017 수정판(공개) + 직접 캡처한 공격 트래픽',
     metrics: [
       ['시연 환경 평가 정확도', '99.87%'],
@@ -51,7 +51,7 @@ export const FLOW_COMPARISON = [
 
 // 하이브리드 흐름 모델 · 직접 캡처 평가분 혼동 행렬 (행: 실제, 열: 예측)
 export const CONFUSION = {
-  classes: ['BENIGN', 'BruteForce', 'DDoS', 'PortScan'],
+  classes: ['BENIGN', 'BruteForce', 'DoS/DDoS', 'PortScan'],
   matrix: [
     [17420, 67, 0, 0],
     [22, 17449, 0, 0],
