@@ -499,4 +499,4 @@ if __name__ == '__main__':
     init_db()
     print(f"[허니팟] 포트 9999 시작 — 모든 요청 로깅 중")
     print(f"[허니팟] 로그: {LOG_FILE}")
-    app.run(host='0.0.0.0', port=9999, debug=False)
+    app.run(host='0.0.0.0', port=9999, debug=False, threaded=True)

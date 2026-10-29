@@ -8,7 +8,7 @@
 #   IPS_UBUNTU_HOST, IPS_UBUNTU_USER, IPS_UBUNTU_IFACE, IPS_SSH_KEY, IPS_PYTHON, IPS_HOME
 # IPS_UBUNTU_IFACE(우분투 캡처 인터페이스)는 우분투 버전/설치에 따라 달라지므로,
 # 실행 전 우분투에서 `ip a`로 확인 후 필요하면 재정의하세요.
-UBUNTU="${IPS_UBUNTU_HOST:-192.168.64.10}"
+UBUNTU="${IPS_UBUNTU_HOST:-192.168.64.2}"
 IPS_UBUNTU_USER="${IPS_UBUNTU_USER:-hisecure}"
 IPS_UBUNTU_IFACE="${IPS_UBUNTU_IFACE:-enp0s1}"
 IPS_SSH_KEY="${IPS_SSH_KEY:-$HOME/.ssh/id_ed25519}"
@@ -38,6 +38,7 @@ echo ""
 echo "🔧 FastAPI 백엔드 시작 중..."
 pkill -f "uvicorn pj.model.main" 2>/dev/null
 sleep 1
+cd "$IPS_DIR" || exit 1   # pj 모듈 임포트하려면 프로젝트 루트에서 실행해야 함
 nohup sudo -E "$IPS_PYTHON" -m uvicorn pj.model.main:app \
     --host 0.0.0.0 --port 8000 \
     > "$IPS_DIR/backend.log" 2>&1 &

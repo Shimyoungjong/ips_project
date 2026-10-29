@@ -198,6 +198,7 @@ class AlertData(BaseModel):
     confidence: float
     is_attack: bool
     blocked: bool
+    threat_level: str = "none"
 
 @app.post("/alert")
 async def receive_alert(data: AlertData):
@@ -206,11 +207,11 @@ async def receive_alert(data: AlertData):
         print(f"  🚫 [ALERT] {data.attacker_ip} 이미 차단된 IP — 무시")
         return {"status": "blocked_skip"}
 
-    # ── HTTP 공격 횟수 카운트 → 임계치(3회/30초) 초과 시 PF 차단 ──
-    count = check_http_count(data.attacker_ip) if data.is_attack else 0  # '미분류 의심'(is_attack=False)은 차단 횟수에서 제외
-    actually_blocked = False
-    if count >= HTTP_BLOCK_THRESHOLD:
-        actually_blocked = block_ip(data.attacker_ip, data.attack_type)
+    # ── 흐름 탐지(realtime_detect)가 등급과 차단을 이미 결정해서 보냄 → 그대로 신뢰 ──
+    # CRITICAL일 때만 Mac 측 blocked_ips/차단 목록에 동기화. HIGH(허니팟) 단계를 조기 차단하지 않음.
+    actually_blocked = data.blocked
+    if data.threat_level == "critical" and data.is_attack:
+        actually_blocked = block_ip(data.attacker_ip, data.attack_type) or data.blocked
 
     now_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     conn = sqlite3.connect(DB_PATH)
@@ -227,7 +228,8 @@ async def receive_alert(data: AlertData):
         "timestamp": now_str,
         "confidence": data.confidence,
         "is_attack": data.is_attack,
-        "blocked": actually_blocked
+        "blocked": actually_blocked,
+        "threat_level": data.threat_level
     })
     return {"status": "ok"}
 
@@ -290,7 +292,7 @@ async def receive_server_log(data: ServerLogData):
         "method": data.method,
         "path": data.path,
         "payload": data.payload,
-        "timestamp": data.timestamp or datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+        "timestamp": datetime.now().strftime('%Y-%m-%d %H:%M:%S'),  # 대시보드 시각은 맥 기준으로 단일화(우분투 시계 안 맞아도 OK)
     }
     server_logs.append(entry)
     if len(server_logs) > 500:
@@ -846,6 +848,11 @@ async def start_ips():
 
     session_start = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     server_logs.clear()   # 메모리 서버 로그 초기화
+    # 대응 단계 기록 초기화 — 같은 공격자의 옛 HIGH 기록이 남아 다음 공격이 바로 CRITICAL로 튀는 것 방지
+    blocked_ips.clear()
+    high_response_time.clear()
+    request_counts.clear()
+    http_attack_counts.clear()
     clear_ubuntu_logs()   # Ubuntu 허니팟 로그 초기화
     # 감시목록 초기화
     conn = sqlite3.connect(DB_PATH)

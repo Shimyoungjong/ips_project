@@ -43,6 +43,8 @@ const LEVELS = {
 const threatLevel = (log) => {
   if (log.attack_type === 'Suspicious') return 'suspicious';
   if (!log.is_attack) return 'benign';
+  // 백엔드가 실제 적용한 대응 등급을 우선 표시 (허니팟=HIGH, 완전차단=CRITICAL 등 단계가 그대로 보이게)
+  if (log.threat_level && LEVELS[log.threat_level]) return log.threat_level;
   if (log.confidence >= LEVEL_CRITICAL) return 'critical';
   if (log.confidence >= LEVEL_HIGH) return 'high';
   if (log.confidence >= LEVEL_MEDIUM) return 'medium';
@@ -431,7 +433,8 @@ function App() {
         }
         if (newLog.is_attack === true || newLog.is_attack === 1) {
           addTimelineEvent(newLog.attack_type, parseTimestamp(newLog.timestamp));
-          if (newLog.confidence >= LEVEL_CRITICAL) setUnacked(n => n + 1);
+          const lv = threatLevel(newLog);
+          if (lv === 'critical') setUnacked(n => n + 1);
           if (newLog.attack_type === 'Honeypot') {
             fetchWatchlist();
           }
@@ -441,7 +444,7 @@ function App() {
               icon: '/favicon.ico'
             });
             fetchBlockedIps();
-          } else if (newLog.confidence >= LEVEL_CRITICAL && Notification.permission === 'granted') {
+          } else if (lv === 'critical' && Notification.permission === 'granted') {
             new Notification('🔴 Critical 공격 탐지!', {
               body: `${typeLabel(newLog.attack_type)} | IP: ${newLog.attacker_ip}`,
               icon: '/favicon.ico'

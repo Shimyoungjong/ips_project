@@ -4,7 +4,7 @@
   "level_medium": 0.55,
   "level_high": 0.65,
   "level_critical": 0.80,
-  "high_to_critical_delay": 10,
+  "high_to_critical_delay": 60,
   "auto_unblock_minutes": 10,
   "enable_block": true,
   "detection_threshold": {
