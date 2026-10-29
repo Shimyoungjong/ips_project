@@ -346,24 +346,34 @@ def respond_critical(ip, attack_type):
         print(f"  ⚠️ 차단 실패: {e}")
 
 def apply_response(ip, conf, attack_type, is_watchlisted):
+    # 확인된 공격(임계값 이상)은 첫 탐지부터 HIGH=허니팟으로 우회해 실서버를 보호하고,
+    # HIGH_TO_CRITICAL_DELAY초 넘게 공격이 이어지면 CRITICAL=완전 차단으로 승격.
+    # 반환: 적용된 등급 문자열(대시보드 표시용).
     if is_whitelisted(ip):
-        return
+        return 'none'
 
     now = time.time()
     if conf >= LEVEL_CRITICAL:
-        # 감시목록 or HIGH 이력 있으면 즉시 CRITICAL, 아니면 HIGH로 격상 후 CRITICAL 준비
-        if is_watchlisted or (ip in high_response_time and (now - high_response_time[ip]) >= HIGH_TO_CRITICAL_DELAY):
+        # HIGH(허니팟) 적용 후 HIGH_TO_CRITICAL_DELAY초가 지나도 공격이 이어질 때만 CRITICAL.
+        # 감시목록 등록만으로 즉시 차단하면 허니팟 단계가 몇 초 만에 끝나 버림
+        if ip in high_response_time and (now - high_response_time[ip]) >= HIGH_TO_CRITICAL_DELAY:
             respond_critical(ip, attack_type)
+            return 'critical'
         else:
             respond_high(ip)
-            high_response_time[ip] = now - HIGH_TO_CRITICAL_DELAY  # 다음번엔 바로 CRITICAL 발동
+            high_response_time.setdefault(ip, now)
+            return 'high'
     elif conf >= LEVEL_HIGH:
         respond_high(ip)
         high_response_time[ip] = now
+        return 'high'
     elif conf >= LEVEL_MEDIUM:
         respond_medium(ip)
+        return 'medium'
     elif conf >= LEVEL_LOW:
         respond_low(ip)
+        return 'low'
+    return 'none'
 
 # ==================== IP 차단 ====================
 blocked_ips = {}     # {ip: unblock_time}
@@ -372,6 +382,13 @@ high_response_time = {}  # {ip: timestamp} HIGH 발동 시각 기록
 HIGH_TO_CRITICAL_DELAY = 60  # HIGH → CRITICAL 최소 대기 시간 (초)
 dst_port_tracker = {}   # {ip: set(dst_ports)} 목적지 포트 추적
 DST_PORT_WINDOW = 30    # 초
+
+# 연결 단위 중복 억제: 하나의 TCP 연결이 FIN 시점에 두 조각(FIN 전/후)으로
+# 쪼개져 같은 흐름이 2번 분류·기록되던 문제를 방지한다. 키는 방향 무관한
+# 연결 식별자(양 끝단 IP:포트를 정렬)라서, 포트가 다른 별개 연결이나 서로
+# 다른 공격 흐름은 영향받지 않는다(= 진짜 여러 플로우는 그대로 다 집계).
+_recent_flows = {}      # {conn_key: last_ts}
+FLOW_DEDUP_WINDOW = 5   # 초
 
 
 def check_attack_count(ip):
@@ -426,7 +443,7 @@ def save_log(attack_type, attacker_ip, confidence, is_attack, blocked):
         print(f"  ⚠️ 로그 저장 실패: {e}")
 
 # ==================== 대시보드 전송 ====================
-def send_to_dashboard(attack_type, attacker_ip, confidence, is_attack, blocked):
+def send_to_dashboard(attack_type, attacker_ip, confidence, is_attack, blocked, threat_level='none'):
     if not ENABLE_DASHBOARD:
         return
     try:
@@ -436,7 +453,8 @@ def send_to_dashboard(attack_type, attacker_ip, confidence, is_attack, blocked):
             "timestamp": datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
             "confidence": confidence,
             "is_attack": is_attack,
-            "blocked": blocked
+            "blocked": blocked,
+            "threat_level": threat_level
         }, timeout=1)
     except Exception:
         pass
@@ -477,6 +495,18 @@ def on_flow_complete(features):
         _dp = int(features.get('dst_port', 0) or 0)
         if PROTECT_TARGET_PORTS and _sp not in PROTECT_TARGET_PORTS and _dp not in PROTECT_TARGET_PORTS:
             return
+
+        # 연결 단위 중복 억제: 같은 연결의 쪼개진 두 조각(FIN 전/후)을 하나로 본다.
+        # 키는 방향 무관하게 양 끝단(IP, 포트)을 정렬 → 별개 연결/공격은 영향 없음.
+        _conn_key = tuple(sorted(((src_ip, _sp), (dst_ip, _dp))))
+        _now_dedup = time.time()
+        if _recent_flows:
+            for _k in [k for k, t in _recent_flows.items() if _now_dedup - t > FLOW_DEDUP_WINDOW]:
+                _recent_flows.pop(_k, None)
+        if _conn_key in _recent_flows and _now_dedup - _recent_flows[_conn_key] < FLOW_DEDUP_WINDOW:
+            _recent_flows[_conn_key] = _now_dedup
+            return
+        _recent_flows[_conn_key] = _now_dedup
 
         # 피처 dict → DataFrame + 파생 피처 (train_mydata.py와 동일)
         df = pd.DataFrame([features])
@@ -536,29 +566,22 @@ def on_flow_complete(features):
             print(f"  🚫 [DROP] {attacker_ip} 이미 차단된 IP — 플로우 무시")
             return
 
-        # 모델이 확신하지 못하는 흐름은 학습에 없는 공격일 수 있음 → 차단 없이 '미분류 의심'으로 표시만
-        if conf < LEVEL_CRITICAL:
-            save_log('Suspicious', attacker_ip, conf, False, False)
-            send_to_dashboard('Suspicious', attacker_ip, conf, False, False)
-            return
-
+        # 공격 클래스를 임계값(기본 80%) 이상 확신할 때만 '공격'. 그 외(정상 예측 or 낮은 확신)는 '정상'으로 표시.
+        # (정상 브라우징이 65% 확신으로 공격 클래스에 찍혀 '미분류 의심'으로 도배되던 오탐 해결)
         threshold = DETECTION_THRESHOLD.get(pred, LEVEL_HIGH)
-        if is_attack and conf < threshold:
+        if not is_attack or conf < threshold:
+            # /alert(백엔드)가 DB 저장까지 하므로 여기서 save_log는 안 함 (흐름 1건이 2줄로 중복 저장되던 버그)
+            send_to_dashboard('BENIGN', attacker_ip, conf, False, False)
             return
 
-        if is_attack:
-            count  = check_attack_count(attacker_ip)
-            is_wl  = attacker_ip in watchlist_cache
-            wl_tag = " [⚠️감시목록]" if is_wl else ""
-            print(f"  🚨 [플로우/{pred}] 탐지! (신뢰도: {conf:.1%}) | IP: {attacker_ip} [{count}/{BLOCK_THRESHOLD}회]{wl_tag}")
-            if count >= BLOCK_THRESHOLD:
-                apply_response(attacker_ip, conf, pred, is_wl)
-                attack_counts[attacker_ip] = []
-            blocked = attacker_ip in blocked_ips
-            save_log(pred, attacker_ip, conf, True, blocked)
-            send_to_dashboard(pred, attacker_ip, conf, True, blocked)
-        else:
-            save_log('BENIGN', attacker_ip, conf, False, False)
+        count  = check_attack_count(attacker_ip)
+        is_wl  = attacker_ip in watchlist_cache
+        wl_tag = " [⚠️감시목록]" if is_wl else ""
+        # 확인된 공격은 첫 탐지부터 바로 대응(허니팟) — 1번째 공격이 실서버로 통과하지 않도록
+        level  = apply_response(attacker_ip, conf, pred, is_wl)
+        blocked = attacker_ip in blocked_ips
+        print(f"  🚨 [플로우/{pred}] 탐지! (신뢰도: {conf:.1%}) | IP: {attacker_ip} [{count}회] → {level.upper()}{wl_tag}")
+        send_to_dashboard(pred, attacker_ip, conf, True, blocked, level)
 
     except Exception:
         pass
@@ -613,9 +636,16 @@ def _agent_server_thread():
 threading.Thread(target=_agent_server_thread, daemon=True).start()
 
 # ==================== Scapy 플로우 수집기 시작 ====================
-flow_collector = ScapyFlowCollector(iface=os.environ.get('IPS_IFACE', 'en0'), callback=on_flow_complete)
-flow_collector.start()
-print("✅ Scapy 플로우 수집기 시작! (en0 전체 트래픽 → RF 모델 탐지)")
+# 기본은 우분투 에이전트(9001) 흐름만 사용. 맥 로컬 스니핑까지 켜면 같은 트래픽이
+# 두 경로로 on_flow_complete를 타서 DB에 2줄씩 중복 저장되므로 기본 OFF.
+# 올인원(맥 혼자) 환경에서만 IPS_LOCAL_SNIFF=1 로 로컬 스니핑을 켠다.
+flow_collector = None
+if os.environ.get('IPS_LOCAL_SNIFF', '0') == '1':
+    flow_collector = ScapyFlowCollector(iface=os.environ.get('IPS_IFACE', 'en0'), callback=on_flow_complete)
+    flow_collector.start()
+    print("✅ Scapy 로컬 플로우 수집기 시작! (en0, IPS_LOCAL_SNIFF=1)")
+else:
+    print("ℹ️  로컬 스니핑 OFF — 우분투 에이전트(9001) 흐름만 사용. 로컬도 켜려면 IPS_LOCAL_SNIFF=1")
 
 print(f"\n{'='*50}")
 print(f"🔍 실시간 IPS 시작! (Scapy 플로우 탐지)")
@@ -656,7 +686,8 @@ try:
             pass
         time.sleep(1)
 except (KeyboardInterrupt, SystemExit):
-    flow_collector.stop()
+    if flow_collector:
+        flow_collector.stop()
     print(f"\n{'='*50}")
     print(f"🛑 IPS 종료!")
     print(f"차단된 IP 수: {len(blocked_ips)}개")
