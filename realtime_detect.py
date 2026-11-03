@@ -18,7 +18,7 @@ from scapy_flow import ScapyFlowCollector
 # 환경변수로 재정의 가능. 미지정 시 기존 기본값과 동일하게 동작.
 #   IPS_HOME        : 프로젝트 루트 (기본 ~/ips_project)
 #   IPS_SSH_KEY     : Ubuntu 접속용 SSH 키 (기본 ~/.ssh/id_ed25519)
-#   IPS_UBUNTU_HOST : Ubuntu 호스트 (기본 192.168.64.10)
+#   IPS_UBUNTU_HOST : Ubuntu 호스트 (기본 192.168.64.2)
 #   IPS_UBUNTU_USER : Ubuntu 사용자 (기본 hisecure)
 IPS_HOME  = os.environ.get("IPS_HOME") or os.path.expanduser("~/ips_project")
 
@@ -73,7 +73,7 @@ EVIDENCE_DIR = os.path.join(IPS_HOME, "evidence")
 os.makedirs(EVIDENCE_DIR, exist_ok=True)
 
 # Ubuntu SSH 정보 (허니팟 iptables redirect용) - bridge100은 항상 고정
-UBUNTU_SSH_HOST      = os.environ.get("IPS_UBUNTU_HOST", '192.168.64.10')
+UBUNTU_SSH_HOST      = os.environ.get("IPS_UBUNTU_HOST", '192.168.64.2')
 UBUNTU_SSH_USER      = os.environ.get("IPS_UBUNTU_USER", 'hisecure')
 UBUNTU_REAL_PORT     = 5000
 UBUNTU_HONEYPOT_PORT = 9999
