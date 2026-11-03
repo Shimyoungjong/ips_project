@@ -12,6 +12,7 @@ from pydantic import BaseModel
 from datetime import datetime, timedelta
 from typing import List, Any, Dict
 import time
+import threading
 import asyncio
 
 app = FastAPI()
@@ -53,6 +54,9 @@ WHITELIST = ['192.168.64.1', '127.0.0.1', '0.0.0.0']
 AUTO_UNBLOCK_MINUTES = 10
 HTTP_BLOCK_THRESHOLD = 3       # 이 횟수 이상이면 PF 차단
 HTTP_BLOCK_WINDOW    = 30      # 초 단위 윈도우
+# 같은 IP 공격 누적 횟수 기반 승격 (모든 공격은 1회부터 허니팟, 아래 횟수부터 승격)
+THROTTLE_COUNT = 3   # 이 횟수↑ → 허니팟 + 연결 속도 지연(MEDIUM)
+BLOCK_COUNT    = 4   # 이 횟수↑ → 완전 차단(CRITICAL)
 
 blocked_ips = {}          # {ip: unblock_time}
 http_attack_counts = {}   # {ip: [timestamp, ...]}  HTTP 공격 카운터
@@ -441,6 +445,19 @@ def respond_critical(ip, attack_type):
         print(f"  ⚠️ [CRITICAL] 차단 실패: {e}")
         return False
 
+def _apply_http_actions(ip, level, attack_type):
+    """detect_http의 실제 대응(pf/우분투 SSH)을 백그라운드에서 실행 — HTTP 응답 지연 방지."""
+    try:
+        if level == "critical":
+            respond_critical(ip, attack_type)   # 완전 차단
+        elif level == "medium":
+            respond_high(ip)                    # 허니팟 유지
+            respond_medium(ip)                  # + 연결 속도 지연
+        else:  # high
+            respond_high(ip)                    # 허니팟 우회
+    except Exception as e:
+        print(f"  ⚠️ [HTTP 대응] {ip} 실패: {e}")
+
 def apply_threat_response(ip: str, conf: float, attack_type: str):
     """신뢰도(conf) 하나만 가지고 LOW/MEDIUM/HIGH/CRITICAL 대응을 실행.
     흐름 기반(PortScan/DDoS)이든 콘텐츠 기반(SQLi/XSS)이든 이 함수 하나로 통일."""
@@ -654,10 +671,20 @@ async def detect_http(data: HttpPayload):
 
     # ── 흐름 기반 탐지와 동일한 4단계(LOW/MEDIUM/HIGH/CRITICAL) 대응으로 통일 ──
     if is_attack:
-        level, blocked = apply_threat_response(data.attacker_ip, conf, pred)
-        print(f"  🚨 [HTTP] {pred} 탐지! IP: {data.attacker_ip} "
-              f"(신뢰도: {conf:.1%}) → 레벨: {level.upper()}"
-              + (" [화이트리스트 제외]" if level == "whitelist" else ""))
+        if data.attacker_ip in WHITELIST:
+            level = "whitelist"
+        else:
+            count = check_http_count(data.attacker_ip)
+            if count >= BLOCK_COUNT:
+                level, blocked = "critical", True
+            elif count >= THROTTLE_COUNT:
+                level = "medium"
+            else:
+                level = "high"
+            # 느린 pf/SSH 대응은 백그라운드로 — 판정만 즉시 반환(우분투 호출 타임아웃 방지)
+            threading.Thread(target=_apply_http_actions,
+                             args=(data.attacker_ip, level, pred), daemon=True).start()
+        print(f"  🚨 [HTTP] {pred} 탐지! IP: {data.attacker_ip} (신뢰도: {conf:.1%}) → {level.upper()}")
 
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()

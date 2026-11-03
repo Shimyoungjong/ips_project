@@ -1,7 +1,7 @@
 # 취약 서버 (진짜 서버, 포트 5000)
 # honeypot_flask.py가 이 파일의 "완전 클론"이라는 주석을 갖고 있어 원본 기준으로 복원함.
 # 우분투 VM에 ~/vulnerable_server/app.py 로 배포해서 실행.
-from flask import Flask, request, session
+from flask import Flask, request, session, Response
 import sqlite3
 import requests as req
 from datetime import datetime
@@ -14,6 +14,7 @@ DB_PATH      = '/tmp/vulnerable_users.db'
 LOG_FILE     = '/tmp/vulnerable_log.txt'
 MAC_API      = 'http://192.168.64.1:8000/server_log'    # Mac FastAPI (bridge100 고정) - 로깅/대시보드용
 MAC_API_HTTP = 'http://192.168.64.1:8000/detect_http'    # Mac FastAPI - SQLi/XSS ML 탐지용
+HONEYPOT_URL = 'http://127.0.0.1:9999'                   # 같은 우분투의 허니팟(투명 프록시 대상)
 
 def send_to_mac(ip, method, path, payload=''):
     try:
@@ -28,17 +29,38 @@ def send_to_mac(ip, method, path, payload=''):
     except:
         pass
 
-def send_to_detect_http(ip, payload):
-    """/search, /board 등에 들어온 값 하나하나를 SQLi/XSS ML 분류기로 보낸다."""
+def classify_http(ip, payload):
+    """입력값을 Mac HTTP 분류기로 '동기' 전송하고 위협등급(threat_level)을 돌려받는다.
+    탐지기 다운 등 실패 시 None → 요청 통과(가용성 우선)."""
     if not payload:
-        return
+        return None
     try:
-        req.post(MAC_API_HTTP, json={
-            "payload": payload,
-            "attacker_ip": ip,
-        }, timeout=2)
-    except:
+        r = req.post(MAC_API_HTTP, json={"payload": payload, "attacker_ip": ip}, timeout=2)
+        if r.ok:
+            return r.json().get("threat_level", "none")
+    except req.RequestException:
         pass
+    return None
+
+def proxy_to_honeypot():
+    """공격 요청을 실서버에서 실행하지 않고, 같은 경로를 허니팟(9999)에 대신 보내
+    그 응답을 그대로 돌려준다(투명 프록시 — 공격자는 주소·화면이 안 바뀜).
+    허니팟 다운 시 fallback으로 403(실서버 보호 우선)."""
+    try:
+        resp = req.request(
+            method=request.method,
+            url=HONEYPOT_URL + request.full_path,
+            data=request.get_data(),
+            headers={k: v for k, v in request.headers if k.lower() != 'host'},
+            cookies=request.cookies,
+            allow_redirects=False,
+            timeout=3,
+        )
+        excluded = {'content-encoding', 'content-length', 'transfer-encoding', 'connection'}
+        headers = [(k, v) for k, v in resp.headers.items() if k.lower() not in excluded]
+        return Response(resp.content, resp.status_code, headers)
+    except req.RequestException:
+        return Response('Forbidden', status=403)
 
 def log_request(extra=''):
     now  = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
@@ -64,13 +86,12 @@ def log_all():
         args=(ip, request.method, request.path, payload_str),
         daemon=True
     ).start()
-    # 입력값 하나하나를 SQLi/XSS ML 분류기로 보냄 (합쳐진 문자열이 아니라 개별 값 기준)
+    # 입력값을 SQLi/XSS 분류기로 '동기' 전송. 고신뢰(HIGH/CRITICAL) 공격이면
+    # 실서버 핸들러를 실행하지 않고 허니팟 응답으로 투명 대체(공격이 실서버에서 안 터지게).
+    # 저신뢰/정상/판정불가는 그대로 통과 → 오탐으로 정상 요청이 막히지 않음.
     for value in payloads:
-        threading.Thread(
-            target=send_to_detect_http,
-            args=(ip, value),
-            daemon=True
-        ).start()
+        if value and classify_http(ip, value) in ('high', 'medium', 'critical'):
+            return proxy_to_honeypot()
 
 # ==================== 공통 HTML ====================
 def base_html(content, title='HiSecure Corp'):
