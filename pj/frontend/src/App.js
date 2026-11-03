@@ -525,7 +525,7 @@ function App() {
                   <th style={styles.th}>탐지 시간</th>
                   <th style={styles.th}>공격 유형</th>
                   <th style={styles.th}>공격자 IP</th>
-                  <th style={styles.th}>모델 신뢰도</th>
+                  <th style={styles.th}>위협 등급</th>
                   <th style={styles.th}>방어 상태</th>
                 </tr>
               </thead>
@@ -554,14 +554,7 @@ function App() {
                       </td>
                       <td style={{ ...styles.td, fontFamily: 'monospace' }}>{log.attacker_ip}</td>
                       <td style={styles.td}>
-                        <div style={{ display: 'flex', alignItems: 'center', gap: '8px', minWidth: '150px' }}>
-                          <div style={{ flex: 1, height: '6px', borderRadius: '3px', backgroundColor: '#334155', overflow: 'hidden' }}>
-                            <div style={{ width: `${pct}%`, height: '100%', backgroundColor: level.color }} />
-                          </div>
-                          <span style={{ fontSize: '12px', color: level.color, fontWeight: 'bold', width: '84px', fontVariantNumeric: 'tabular-nums' }}>
-                            {pct}% {level.label}
-                          </span>
-                        </div>
+                        <span style={{ fontSize: '13px', color: level.color, fontWeight: 'bold' }}>{level.label}</span>
                       </td>
                       <td style={styles.td}><span style={styles.badge(log.blocked)}>{log.blocked ? '차단 완료' : '탐지됨'}</span></td>
                     </tr>
@@ -948,7 +941,7 @@ function App() {
               </div>
 
               <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '10px', marginBottom: '20px', fontSize: '14px' }}>
-                {[['탐지 시간', log.timestamp], ['공격자 IP', log.attacker_ip], ['방어 상태', log.blocked ? '차단 완료' : log.is_attack ? '탐지됨 (단계별 대응 중)' : '조치 없음'], ['판정 모델', `${m.name} · ${m.algo}`]].map(([k, v]) => (
+                {[['탐지 시간', log.timestamp], ['공격자 IP', log.attacker_ip], ['방어 상태', log.blocked ? '완전 차단' : threatLevel(log) === 'high' ? '허니팟 우회' : threatLevel(log) === 'medium' ? '속도 지연 + 허니팟' : log.is_attack ? '탐지됨' : '조치 없음'], ['판정 모델', `${m.name} · ${m.algo}`]].map(([k, v]) => (
                   <div key={k} style={{ background: '#0f172a', borderRadius: '10px', padding: '10px 14px' }}>
                     <div style={{ fontSize: '12px', color: '#94a3b8' }}>{k}</div>
                     <div style={{ marginTop: '2px', fontFamily: k === '공격자 IP' ? 'monospace' : 'inherit' }}>{v}</div>
